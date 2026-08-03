@@ -4,7 +4,7 @@ from sklearn.datasets import load_iris
 from sklearn import set_config
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.compose import ColumnTransformer, make_column_transformer, make_column_selector, TransformedTargetRegressor
-from sklearn.preprocessing import StandardScaler, OneHotEncoder, RobustScaler, PowerTransformer, QuantileTransformer, MinMaxScaler, MaxAbsScaler, Normalizer, OrdinalEncoder, TargetEncoder
+from sklearn.preprocessing import StandardScaler, OneHotEncoder, RobustScaler, PowerTransformer, QuantileTransformer, MinMaxScaler, MaxAbsScaler, Normalizer, OrdinalEncoder, TargetEncoder, KBinsDiscretizer, Binarizer, FunctionTransformer
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import make_pipeline, make_union, FeatureUnion
 from sklearn.linear_model import LogisticRegression, Ridge, Lasso
@@ -440,3 +440,228 @@ X_zip_encoded = target_enc.fit_transform(X[['zip_code']], y)
 print(f"X['zip_code'] after Target Encoder:\n", X_zip_encoded)
 print()
 '''
+
+'''
+df = pd.DataFrame({
+    'income': [15000, 18000, 22000, 25000, 40000, 50000, 60000, 80000, 120000, 1000000]
+})
+
+est_quantile = KBinsDiscretizer(
+    n_bins=4,
+    encode='ordinal',
+    strategy='quantile'
+)
+
+df_quantile = est_quantile.fit_transform(df[['income']])
+print(df_quantile)
+
+print("\nГраницы корзин (bin_edges_):")
+print(est_quantile.bin_edges_)
+
+est_uniform = KBinsDiscretizer(
+    n_bins=3, 
+    encode='onehot-dense', 
+    strategy='uniform'
+)
+
+df_onehot = est_uniform.fit_transform(df[['income']])
+print(df_onehot)
+
+data = pd.DataFrame({
+    'age': [22, 55, 33, 45, 61, 19],
+    'salary': [30000, 90000, 50000, 120000, 85000, 25000],
+    'gender': ['M', 'F', 'F', 'M', 'F', 'M'],
+    'target': [0, 1, 0, 1, 1, 0]
+})
+
+X = data.drop(columns=['target'])
+y = data['target']
+
+# Настраиваем обработку:
+# - 'age' дискретизируем на 3 корзины
+# - 'salary' масштабируем через StandardScaler
+# - 'gender' кодируем через OneHotEncoder
+
+preprocessor = ColumnTransformer(
+    transformers=[
+        ('age_bins', KBinsDiscretizer(n_bins=3, encode='onehot', strategy='quantile'), ['age']),
+        ('salary_scale', StandardScaler(), ['salary']),
+        ('gender_ohe', OneHotEncoder(drop='if_binary'), ['gender'])
+    ]
+)
+
+# Собираем итоговый пайплайн
+pipeline = make_pipeline(preprocessor, LogisticRegression())
+pipeline.fit(X, y)
+
+# Все значения > 50000 станут 1, остальные 0
+binarizer = Binarizer(threshold=50000)
+df_binarized = binarizer.fit_transform(df[['income']])
+
+print(df_binarized)
+
+'''
+
+# Создаем трансформер для логарифмирования np.log1p (log(1 + x))
+log_transformer = FunctionTransformer(
+    func=np.log1p,
+    inverse_func=np.expm1,
+    validate=False
+)
+
+df = pd.DataFrame({'income': [10000, 50000, 150000]})
+
+# Логарифмируем
+df_log = log_transformer.fit_transform(df)
+print("После логарифмирования:\n", df_log)
+
+# Восстанавливаем исходные значения
+df_original = log_transformer.inverse_transform(df_log)
+
+def extract_date_features(X):
+    """Принимает DataFrame с колонкой 'date' и возвращает новые признаки."""
+    
+    X_out = X.copy()
+    dates = pd.to_datetime(X_out['date'])
+    
+    X_out['year'] = dates.dt.year
+    X_out['month'] = dates.dt.month
+    X_out['dayofweek'] = dates.dt.dayofweek
+    
+    return X_out.drop(columns=['date'])
+
+# Создаем трансформер (validate=False важен для работы с Pandas DataFrame)
+date_transformer = FunctionTransformer(extract_date_features, validate=False)
+
+df_dates = pd.DataFrame({'date': ['2026-01-15', '2026-08-03']})
+df_features = date_transformer.fit_transform(df_dates)
+print(df_features)
+
+
+### Архитектура класса в Scikit-Learn:
+# Для полной интеграции с экосистемой Scikit-Learn класс должен наследоваться
+# от двух базовых классов:
+
+# TransformerMixin:
+
+#   Автоматически добавляет метод fit_transform(X, y) на основе ваших методов fit() и transform()
+#   Позволяет использовать метод set_output(transform="pandas").
+
+# BaseEstimator:
+
+#   Автоматически добавляет методы get_params() и set_params()
+#   Важное правило: В методе __init__ все параметры должны приниматься
+#     в явном виде с дефолтными значениями и просто присваиваться через
+#     self.param = param без вычислений и изменений! Это критично для
+#     корректной работы GridSearchCV.
+
+### Требования к написанию методов:
+#   __init__(self, ...):
+#       Объявление гиперпараметров трансформера.
+
+#   fit(self, X, y=None):
+#       Вычисляет внутренние параметры на основе X (и y, если нужно).
+#         Вычисленные параметры сохраняются в атрибуты класса, заканчивающиеся на
+#         нижнее подчеркивание _ (например, self.mean_, self.quantile_bounds_).
+#         Это соглашение API Scikit-Learn.
+#       Обязательно возвращает self!
+
+#   transform(self, X):
+#       Применяет сохраненные параметры к X и возвращает преобразованные данные.
+
+#   get_feature_names_out(self, input_features=None) (Опционально):
+#       Возвращает имена столбцов на выходе.
+
+
+'''
+class OutlierClipper(BaseEstimator, TransformerMixin):
+    """
+    Трансформер для ограничения выбросов по заданным квантилям.
+    """
+    
+    def __init__(
+        self,
+        lower_quantile: float=0.05,
+        upper_quantile: float=0.95
+    ):
+        self.lower_quantile = lower_quantile
+        self.upper_quantile = upper_quantile
+        
+    def fit(self, X, y=None):
+        X_df = pd.DataFrame(X)
+        
+        # Вычисляем параметры на TRAIN и сохраняем в атрибуты с _ на конце
+        self.lower_bounds_ = X_df.quantile(self.lower_quantile)
+        self.upper_bounds_ = X_df.quantile(self.upper_quantile)
+        self.feature_names_in_ = np.array(X_df.columns, dtype=object)
+        
+        return self
+    
+    def transform(self, X):
+        X_df = pd.DataFrame(X).copy()
+        
+        return X_df.clip(lower=self.lower_bounds_, upper=self.upper_bounds_, axis=1)
+    
+    def get_feature_names_out(self, input_features=None):
+        
+        if input_features is not None:
+            return np.asarray(input_features, dtype=object)
+        
+        return self.feature_names_in_
+    
+# Демонстрация использования
+X_train = pd.DataFrame({'price': [10, 100, 105, 110, 115, 120, 1000]}) # 10 и 1000 - выбросы
+X_test  = pd.DataFrame({'price': [5, 112, 2000]})
+
+clipper = OutlierClipper(lower_quantile=0.10, upper_quantile=0.90)
+
+# Обучаем на train
+X_train_clipped = clipper.fit_transform(X_train)
+print("Обученный Train:\n", X_train_clipped)
+
+# На тесте используем границы, посчитанные на train
+X_test_clipped = clipper.transform(X_test)
+print("\nПреобразованный Test:\n", X_test_clipped)
+
+
+class CreditFeatureEngineer(BaseEstimator, TransformerMixin):
+    """
+    Генерирует Debt-to-Income ratio и объединяет редкие категории работы.
+    """
+    def __init__(self, min_category_freq: int = 2):
+        self.min_category_freq = min_category_freq
+
+    def fit(self, X, y=None):
+        X_df = pd.DataFrame(X)
+        
+        # Находим частые категории работы на Train
+        job_counts = X_df['job_type'].value_counts()
+        self.frequent_jobs_ = set(job_counts[job_counts >= self.min_category_freq].index)
+        
+        return self
+
+    def transform(self, X):
+        X_df = pd.DataFrame(X).copy()
+        
+        # 1. Расчет нового числового признака
+        X_df['dti_ratio'] = X_df['total_debt'] / (X_df['annual_income'] + 1e-5)
+        
+        # 2. Замена редких категорий на 'Other' с помощью сохраненного множества frequent_jobs_
+        X_df['job_type'] = X_df['job_type'].apply(
+            lambda job: job if job in self.frequent_jobs_ else 'Other'
+        )
+        
+        return X_df
+
+# Тестовые данные
+df_credit = pd.DataFrame({
+    'annual_income': [50000, 100000, 30000, 80000],
+    'total_debt': [10000, 15000, 20000, 5000],
+    'job_type': ['Developer', 'Developer', 'Designer', 'Astronaut']
+})
+
+fe_transformer = CreditFeatureEngineer(min_category_freq=2)
+df_transformed = fe_transformer.fit_transform(df_credit)
+print(df_transformed)
+'''
+
