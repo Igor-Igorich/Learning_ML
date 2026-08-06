@@ -1,3 +1,4 @@
+'''
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import KFold, cross_validate
@@ -87,3 +88,97 @@ print("Результаты 5-Fold кросс-валидации:")
 print("-" * 60)
 print(results_df)
 print("-" * 60)
+'''
+
+import numpy as np
+import pandas as pd
+from sklearn.datasets import make_classification
+from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import make_pipeline
+
+# ------------------------------------------------------------------------------
+# 1. Генерация синтетического датасета с шумом
+# ------------------------------------------------------------------------------
+# flip_y=0.15 зашумляет 15% меток классов (случайно меняет их на противоположные).
+# n_informative=6, n_redundant=2 добавляют реалистичную структуру признаков.
+X, y = make_classification(
+    n_samples=10000,
+    n_features=10,
+    n_informative=6,
+    n_redundant=2,
+    n_clusters_per_class=2,
+    flip_y=0.15,
+    random_state=42
+)
+
+print(f'X:\n{X}')
+print(f'y:\n{y}')
+
+# Оборачиваем моделирование в Pipeline для правильного масштабирования признаков без Data Leakage
+pipeline = make_pipeline(
+    StandardScaler(),
+    LogisticRegression(random_state=42)
+)
+
+# ------------------------------------------------------------------------------
+# 2. Одиночное разбиение (Holdout validation: Train / Test)
+# ------------------------------------------------------------------------------
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=y
+)
+
+# Обучение и оценка
+pipeline.fit(X_train, y_train)
+single_split_acc = pipeline.score(X_test, y_test)
+
+print("=" * 65)
+print("1. ОДИНОЧНОЕ РАЗБИЕНИЕ (Train/Test Split 80/20)")
+print(f"   Accuracy на тестовой выборке: {single_split_acc:.4f}")
+print("=" * 65)
+
+# ------------------------------------------------------------------------------
+# 3. Кросс-валидация (5-Fold Cross-Validation)
+# ------------------------------------------------------------------------------
+# Для классификации по умолчанию в sklearn используется StratifiedKFold
+cv_scheme = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+cv_scores = cross_val_score(
+    estimator=pipeline,
+    X=X,
+    y=y,
+    cv=cv_scheme,
+    scoring='accuracy'
+)
+
+print("\n2. КРОСС-ВАЛИДАЦИЯ (5-Fold CV)")
+print(f"   Массив оценок по фолдам:  {np.round(cv_scores, 4)}")
+print(f"   Среднее значение (Mean):  {cv_scores.mean():.4f}")
+print(f"   Стандартное отклонение:   {cv_scores.std():.4f}")
+print("=" * 65)
+
+# ------------------------------------------------------------------------------
+# 4. АНАЛИТИЧЕСКИЙ КОММЕНТАРИЙ
+# ------------------------------------------------------------------------------
+"""
+АНАЛИЗ НАДЕЖНОСТИ ПОДХОДОВ:
+
+1. Одиночное разбиение (Holdout):
+   - Оценка метрики (Accuracy = {:.4f}) зависит от точного случайного разделения
+     данных на train/test. При изменении random_state точечная оценка может сместиться.
+   - Подход обучается только на 80% данных, теряя часть информации для обучения.
+
+2. Кросс-валидация (5-Fold CV):
+   - Дает робастную оценку математического ожидания ошибки ({:.4f}) и дисперсию
+     модели (std = {:.4f}) на различных подвыборках.
+   - Каждый объект выборки успевает побывать в валидационном фолде ровно 1 раз.
+   - Стандартное отклонение ({:.4f}) показывает, насколько стабильно ведет себя
+     модель: низкое std подтверждает, что логистическая регрессия не переобучается
+     и сохраняет ровное качество независимо от разбиения.
+
+ВЫВОД:
+Для зашумленных данных кросс-валидация значительно надежнее, так как позволяет
+отделить реальный сигнал модели от случайного попадания "удачных" или "неудачных"
+объектов в единственный валидационный сет.
+""".format(single_split_acc, cv_scores.mean(), cv_scores.std(), cv_scores.std())
