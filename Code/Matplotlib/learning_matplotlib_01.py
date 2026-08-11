@@ -1,8 +1,7 @@
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
-
-import matplotlib.pyplot as plt
 
 """
 x = np.arange(7)
@@ -537,3 +536,11 @@ plt.show()
 # plt.rcParams['figure.figsize'] = 8, 5
 # plt.rcParams['font.size'] = 12
 # plt.rcParams['savefig.format'] = 'pdf'
+
+"""
+tips = sns.load_dataset("tips")
+
+sns.boxplot(x="day", y="total_bill", data=tips)
+
+plt.show()
+"""
