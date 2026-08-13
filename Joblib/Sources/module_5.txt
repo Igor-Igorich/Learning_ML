@@ -1,0 +1,639 @@
+   # Модуль 5. `joblib` в ML-пайплайнах: интеграция со scikit-learn
+
+---
+
+## Зачем этот модуль
+
+В предыдущих модулях мы учились использовать `joblib` **вручную**: сами вызывали `dump`/`load`, сами создавали `Parallel`, сами кешировали функции. Но в реальной жизни `joblib` уже встроен в саму экосистему машинного обучения — в первую очередь в **scikit-learn**.
+
+Когда вы пишете `RandomForestClassifier(n_jobs=-1)` или `GridSearchCV(..., n_jobs=4)`, под капотом работает именно `joblib`. Если не понимать эту связь, можно:
+- не получить ускорения там, где оно возможно;
+- получить конфликты при вложенном параллелизме;
+- сломать сериализацию, сохраняя сложные пайплайны.
+
+В этом модуле мы разберём, как `sklearn` использует `joblib` изнутри, и научимся правильно сохранять, загружать и распараллеливать полноценные ML-пайплайны.
+
+---
+
+## 1. Что такое Pipeline в sklearn (объяснение с нуля)
+
+### Проблема: «забытый скейлер»
+
+Представьте, что вы обучили модель. Перед обучением вы нормализовали данные: вычли среднее и разделили на стандартное отклонение. Модель хорошо предсказывает.
+
+Через неделю коллега загружает вашу модель, подаёт на вход **сырые** данные — и получает мусор. Потому что модель обучена на нормализованных данных, а новые данные не нормализованы.
+
+### Решение: объединить шаги в цепочку
+
+`Pipeline` в `sklearn` — это объект, который объединяет несколько шагов обработки в **одну последовательность**. Он гарантирует, что при обучении и при предсказании шаги выполняются в одном и том же порядке.
+
+```python
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+
+# Создаём Pipeline: шаг 1 -> шаг 2
+pipeline = Pipeline([
+    ('scaler', StandardScaler()),      # имя шага: объект
+    ('model', LogisticRegression())    # имя шага: объект
+])
+
+# Обучаем ВЕСЬ Pipeline
+pipeline.fit(X_train, y_train)
+
+# Предсказываем — scaler применяется автоматически!
+predictions = pipeline.predict(X_test)
+```
+
+### Что происходит при `fit`
+
+1. `StandardScaler` обучается на `X_train` (запоминает среднее и стандартное отклонение).
+2. `X_train` масштабируется.
+3. `LogisticRegression` обучается на масштабированных данных.
+
+### Что происходит при `predict`
+
+1. `X_test` пропускается через обученный `StandardScaler` (с теми же средним и стандартным отклонением).
+2. Масштабированные данные подаются в обученную модель.
+3. Возвращается предсказание.
+
+**Вы ничего не можете забыть** — Pipeline делает всё сам.
+
+---
+
+## 2. Как sklearn использует `joblib` под капотом
+
+### Параметр `n_jobs` в моделях sklearn
+
+Многие модели и инструменты sklearn имеют параметр `n_jobs`:
+
+```python
+from sklearn.ensemble import RandomForestClassifier
+
+model = RandomForestClassifier(n_estimators=100, n_jobs=-1)
+```
+
+**Что происходит внутри**, когда вы вызываете `model.fit(X, y)`:
+
+1. `RandomForest` решает обучить 100 деревьев.
+2. Он создаёт внутри себя `joblib.Parallel(n_jobs=-1, backend='loky')`.
+3. Каждое дерево обучается в отдельном процессе (или группе процессов).
+4. Результаты собираются обратно.
+
+То есть `sklearn` **сам** вызывает `joblib.Parallel` — вам не нужно писать это руками.
+
+### Где ещё встречается `n_jobs`
+
+| Класс/функция | Что параллелится |
+|---------------|-----------------|
+| `RandomForestClassifier` | Обучение деревьев |
+| `GradientBoostingClassifier` | Поиск разбиений |
+| `KMeans` | Инициализация и итерации |
+| `cross_val_score` | Фолды кросс-валидации |
+| `GridSearchCV` | Комбинации гиперпараметров |
+| `RandomizedSearchCV` | Случайные комбинации |
+
+### Важный нюанс: вложенный `Parallel`
+
+Если вы оборачиваете `GridSearchCV(n_jobs=-1)` в свой `joblib.Parallel(n_jobs=-1)` — получается **вложенный параллелизм**. Процессы создают процессы, система захлёбывается, скорость падает.
+
+**Правило:** если `sklearn` уже использует `n_jobs` внутри, не оборачивайте это ещё один `Parallel` снаружи.
+
+---
+
+## 3. Сохранение и загрузка полного Pipeline
+
+### Почему Pipeline — идеальный кандидат для `dump`
+
+Pipeline — это один Python-объект, который содержит внутри себя **все обученные шаги**. Если сохранить его через `joblib.dump` — вы сохраните:
+- обученный скейлер (средние, стандартные отклонения);
+- обученный отборщик признаков (если есть);
+- обученную модель (веса, деревья);
+- имена шагов и их порядок.
+
+### Полный пример: создание, обучение, сохранение, загрузка
+
+```python
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler, PolynomialFeatures
+from sklearn.linear_model import Ridge
+from sklearn.datasets import fetch_california_housing
+from sklearn.model_selection import train_test_split
+from joblib import dump, load
+
+# 1. Данные
+data = fetch_california_housing()
+X_train, X_test, y_train, y_test = train_test_split(
+    data.data, data.target, test_size=0.2, random_state=42
+)
+
+# 2. Создаём Pipeline
+pipeline = Pipeline([
+    ('scaler', StandardScaler()),
+    ('poly', PolynomialFeatures(degree=2, include_bias=False)),
+    ('model', Ridge(alpha=1.0))
+])
+
+# 3. Обучаем
+pipeline.fit(X_train, y_train)
+
+# 4. Проверяем
+print("R² на тесте:", pipeline.score(X_test, y_test))
+
+# 5. Сохраняем ВЕСЬ Pipeline
+dump(pipeline, 'california_pipeline.joblib', compress=3)
+print("Pipeline сохранён!")
+```
+
+**Новый скрипт или перезапуск:**
+
+```python
+from joblib import load
+import numpy as np
+
+# Загружаем
+pipeline = load('california_pipeline.joblib')
+
+# Подаём сырые данные — Pipeline сам масштабирует и создаст полиномы
+sample = np.array([[8.3252, 41.0, 6.984127, 1.023810, 322.0, 2.555556, 37.88, -122.23]])
+prediction = pipeline.predict(sample)
+print("Предсказание:", prediction)
+```
+
+### Что внутри сохранённого Pipeline
+
+Если заглянуть внутрь загруженного объекта:
+
+```python
+print(pipeline.named_steps)
+# {
+#   'scaler': StandardScaler(),
+#   'poly': PolynomialFeatures(...),
+#   'model': Ridge(...)
+# }
+
+# Доступ к обученным параметрам отдельного шага
+print(pipeline.named_steps['scaler'].mean_)      # средние значения
+print(pipeline.named_steps['model'].coef_)       # веса модели
+```
+
+---
+
+## 4. Кастомные трансформеры: правила для сериализации
+
+### Что такое кастомный трансформер
+
+Иногда встроенных шагов `sklearn` не хватает. Например, вы хотите добавить шаг, который берёт логарифм от признака. Для этого создаётся **свой трансформер**.
+
+### Способ 1: `FunctionTransformer`
+
+```python
+from sklearn.preprocessing import FunctionTransformer
+import numpy as np
+
+# Именованная функция (НЕ lambda!)
+def log_transform(X):
+    return np.log1p(X)  # log(1 + x), безопасно для нулей
+
+log_step = FunctionTransformer(log_transform)
+
+pipeline = Pipeline([
+    ('log', log_step),
+    ('scaler', StandardScaler()),
+    ('model', LogisticRegression())
+])
+```
+
+**Почему нельзя использовать `lambda`:**
+
+```python
+# ПЛОХО — не сериализуется!
+log_step = FunctionTransformer(lambda x: np.log1p(x))
+
+dump(pipeline, 'bad_pipeline.joblib')
+# Ошибка: PicklingError: Can't pickle <function <lambda> ...
+```
+
+`pickle` и `joblib` не умеют сохранять `lambda`-функции, потому что у них нет имени, по которому можно восстановить код в другом процессе.
+
+### Способ 2: Полноценный класс-трансформер
+
+Если ваш трансформер сложный и требует обучения (запоминания параметров), создайте класс:
+
+```python
+from sklearn.base import BaseEstimator, TransformerMixin
+import numpy as np
+
+class OutlierClipper(BaseEstimator, TransformerMixin):
+    """
+    Обрезает выбросы: всё, что больше threshold, заменяет на threshold.
+    Запоминает threshold при обучении.
+    """
+    def __init__(self, threshold=3.0):
+        self.threshold = threshold
+    
+    def fit(self, X, y=None):
+        # Запоминаем границы для каждого признака
+        self.lower_ = np.percentile(X, self.threshold)
+        self.upper_ = np.percentile(X, 100 - self.threshold)
+        return self  # важно: fit всегда возвращает self
+    
+    def transform(self, X):
+        return np.clip(X, self.lower_, self.upper_)
+
+# Используем в Pipeline
+pipeline = Pipeline([
+    ('clipper', OutlierClipper(threshold=5.0)),
+    ('scaler', StandardScaler()),
+    ('model', Ridge())
+])
+
+pipeline.fit(X_train, y_train)
+dump(pipeline, 'pipeline_with_custom.joblib')  # Работает!
+```
+
+### Правила для кастомных трансформеров
+
+| Правило | Почему |
+|---------|--------|
+| Наследоваться от `BaseEstimator` | sklearn узнаёт объект как «эстиматор» |
+| Наследоваться от `TransformerMixin` | Автоматически появляется метод `fit_transform` |
+| `fit` возвращает `self` | Договорённость sklearn |
+| Не использовать `lambda` | Не сериализуется |
+| Все параметры `__init__` сохранять как атрибуты `self` | `joblib` сериализует только атрибуты |
+| Атрибуты, появляющиеся в `fit`, должны заканчиваться на `_` | Договорённость sklearn (`coef_`, `mean_`) |
+
+---
+
+## 5. `GridSearchCV` и `RandomizedSearchCV`: распараллеливание поиска
+
+### Что такое поиск гиперпараметров (с нуля)
+
+Гиперпараметры — это настройки модели, которые **не обучаются** из данных, а задаются до обучения. Например:
+- `n_estimators` в RandomForest (сколько деревьев);
+- `max_depth` (глубина деревьев);
+- `C` в LogisticRegression (сила регуляризации).
+
+Чтобы найти лучшие значения, пробуют разные комбинации и сравнивают качество. `GridSearchCV` перебирает **все** комбинации из заданной сетки.
+
+### Как работает `GridSearchCV`
+
+```python
+from sklearn.model_selection import GridSearchCV
+from sklearn.ensemble import RandomForestClassifier
+
+# Модель
+model = RandomForestClassifier(random_state=42)
+
+# Сетка параметров
+param_grid = {
+    'n_estimators': [50, 100, 200],
+    'max_depth': [3, 5, None]
+}
+
+# Поиск
+search = GridSearchCV(
+    estimator=model,
+    param_grid=param_grid,
+    cv=3,           # 3-кратная кросс-валидация
+    scoring='accuracy',
+    n_jobs=-1       # ПАРАЛЛЕЛИЗМ через joblib!
+)
+
+search.fit(X_train, y_train)
+
+print("Лучшие параметры:", search.best_params_)
+print("Лучшая точность:", search.best_score_)
+```
+
+### Что происходит под капотом
+
+`GridSearchCV` с `n_jobs=-1` создаёт внутри `joblib.Parallel` и запускает обучение для каждой комбинации параметров в отдельном процессе.
+
+Всего комбинаций: 3 (`n_estimators`) × 3 (`max_depth`) × 3 (cv фолда) = **27 задач**. Они распределяются по ядрам CPU.
+
+### `RandomizedSearchCV`
+
+Если сетка огромная, перебирать всё долго. `RandomizedSearchCV` пробует случайные комбинации:
+
+```python
+from sklearn.model_selection import RandomizedSearchCV
+from scipy.stats import randint
+
+param_distributions = {
+    'n_estimators': randint(50, 500),
+    'max_depth': [3, 5, 10, None]
+}
+
+search = RandomizedSearchCV(
+    estimator=model,
+    param_distributions=param_distributions,
+    n_iter=20,      # попробовать только 20 случайных комбинаций
+    cv=3,
+    n_jobs=-1,
+    random_state=42
+)
+```
+
+### Сохранение лучшей модели
+
+После поиска важно сохранить не весь `GridSearchCV` (он тяжёлый), а **лучшую модель**:
+
+```python
+# Лучший обученный estimator
+best_model = search.best_estimator_
+
+# Сохраняем
+dump(best_model, 'best_model.joblib', compress=3)
+
+# Или сохраняем весь Pipeline, если GridSearchCV искал по Pipeline
+dump(search.best_estimator_, 'best_pipeline.joblib', compress=3)
+```
+
+### Предупреждение: вложенный Parallel
+
+**НЕ ДЕЛАЙТЕ ТАК:**
+
+```python
+# Опасно: GridSearchCV уже использует n_jobs=-1 внутри
+results = Parallel(n_jobs=-1)(
+    delayed(some_func)(search) for search in searches
+)
+```
+
+Если внутри `some_func` вызывается `GridSearchCV(n_jobs=-1)`, получится вложенность: ваш `Parallel` создаёт процессы, а внутри каждого процесса `sklearn` создаёт ещё процессы. Система «захлёбывается».
+
+**Правило:**
+- Или `GridSearchCV(n_jobs=-1)` + последовательный цикл снаружи;
+- Или `GridSearchCV(n_jobs=1)` + `Parallel` снаружи.
+
+---
+
+## 6. Backend-сценарии
+
+### Сценарий A: Сохранение эксперимента целиком
+
+```python
+from datetime import datetime
+from joblib import dump
+
+# После GridSearchCV
+artifacts = {
+    'best_pipeline': search.best_estimator_,
+    'best_params': search.best_params_,
+    'best_score': search.best_score_,
+    'cv_results': search.cv_results_,  # полная таблица результатов
+    'timestamp': datetime.now().isoformat(),
+    'sklearn_version': sklearn.__version__
+}
+
+dump(artifacts, 'experiment_full.joblib', compress=3)
+```
+
+### Сценарий B: Загрузка Pipeline в FastAPI
+
+```python
+from fastapi import FastAPI
+from joblib import load
+import numpy as np
+
+app = FastAPI()
+
+# Загружаем Pipeline один раз при старте
+pipeline = load('production_pipeline.joblib')
+
+@app.post("/predict")
+def predict(features: list[list[float]]):
+    X = np.array(features)
+    preds = pipeline.predict(X)
+    return {
+        "predictions": preds.tolist(),
+        "pipeline_steps": list(pipeline.named_steps.keys())
+    }
+```
+
+### Сценарий C: Pipeline с кастомным трансформером в production
+
+```python
+# При загрузке кастомного Pipeline в другом скрипте
+# нужно, чтобы класс трансформера был доступен!
+
+from my_transformers import OutlierClipper  # импорт вашего класса
+
+pipeline = load('pipeline_with_custom.joblib')
+# Без импорта класса joblib не сможет восстановить объект
+```
+
+> **Важно:** если вы сохранили Pipeline с кастомным классом, при загрузке этот класс должен быть **импортирован** в том же пространстве имён. Иначе `joblib` выдаст `AttributeError: Can't get attribute 'OutlierClipper'`.
+
+---
+
+## 7. Практика: задания
+
+### Задание 5.1: «Pipeline от и до»
+
+1. Загрузите датасет `load_iris()`.
+2. Создайте `Pipeline` из трёх шагов:
+   - `StandardScaler`;
+   - `PCA(n_components=2)`;
+   - `LogisticRegression(max_iter=200)`.
+3. Обучите Pipeline.
+4. Сохраните в `iris_pipeline.joblib` с `compress=3`.
+5. Создайте **новый скрипт**, загрузите Pipeline.
+6. Подайте на вход один пример из `X_test` (без ручного масштабирования!) и получите предсказание.
+7. Выведите список шагов Pipeline через `named_steps`.
+
+### Задание 5.2: «Кастомный трансформер»
+
+1. Создайте класс `TopNSelector`, который:
+   - в `fit` запоминает индексы топ-N признаков по дисперсии;
+   - в `transform` возвращает только эти N признаков.
+2. Встроьте его в Pipeline: `TopNSelector(n_features=2)` → `StandardScaler` → `LogisticRegression`.
+3. Обучите и сохраните Pipeline.
+4. Загрузите в новом скрипте (не забудьте импортировать класс!).
+5. Сделайте предсказание.
+
+### Задание 5.3: «GridSearchCV с параллелизмом»
+
+1. Используйте `RandomForestClassifier` на датасете `Iris`.
+2. Задайте сетку:
+   - `n_estimators`: [50, 100];
+   - `max_depth`: [3, 5, None].
+3. Запустите `GridSearchCV` с `cv=3` и `n_jobs=-1`.
+4. Выведите лучшие параметры и лучшую точность.
+5. Сохраните `best_estimator_` в `grid_best.joblib`.
+6. Замерьте время поиска с `n_jobs=1` и `n_jobs=-1`. Во сколько раз ускорилось?
+
+### Задание 5.4: «Ловушка lambda»
+
+1. Создайте Pipeline с шагом `FunctionTransformer(lambda x: x + 1)`.
+2. Попробуйте сохранить через `joblib.dump`.
+3. Убедитесь, что получите ошибку сериализации.
+4. Исправьте: замените `lambda` на именованную функцию.
+5. Сохраните успешно.
+
+---
+
+## 8. Эталонные решения
+
+### Решение 5.1
+
+```python
+# train.py
+from sklearn.datasets import load_iris
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.linear_model import LogisticRegression
+from joblib import dump
+
+iris = load_iris()
+X_train, X_test, y_train, y_test = train_test_split(
+    iris.data, iris.target, test_size=0.2, random_state=42
+)
+
+pipeline = Pipeline([
+    ('scaler', StandardScaler()),
+    ('pca', PCA(n_components=2)),
+    ('clf', LogisticRegression(max_iter=200))
+])
+
+pipeline.fit(X_train, y_train)
+print("Accuracy:", pipeline.score(X_test, y_test))
+
+dump(pipeline, 'iris_pipeline.joblib', compress=3)
+```
+
+```python
+# predict.py
+from joblib import load
+import numpy as np
+
+pipeline = load('iris_pipeline.joblib')
+print("Шаги:", list(pipeline.named_steps.keys()))
+
+sample = np.array([[5.1, 3.5, 1.4, 0.2]])
+pred = pipeline.predict(sample)
+print("Предсказание:", pred)
+```
+
+### Решение 5.2
+
+```python
+import numpy as np
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.datasets import load_iris
+from joblib import dump, load
+
+class TopNSelector(BaseEstimator, TransformerMixin):
+    def __init__(self, n_features=2):
+        self.n_features = n_features
+    
+    def fit(self, X, y=None):
+        variances = np.var(X, axis=0)
+        self.top_indices_ = np.argsort(variances)[-self.n_features:]
+        return self
+    
+    def transform(self, X):
+        return X[:, self.top_indices_]
+
+# Pipeline
+pipeline = Pipeline([
+    ('selector', TopNSelector(n_features=2)),
+    ('scaler', StandardScaler()),
+    ('clf', LogisticRegression(max_iter=200))
+])
+
+iris = load_iris()
+pipeline.fit(iris.data, iris.target)
+
+dump(pipeline, 'custom_pipeline.joblib')
+print("Сохранено!")
+
+# Загрузка (в другом файле нужен импорт класса!)
+loaded = load('custom_pipeline.joblib')
+print("Предсказание:", loaded.predict(iris.data[:3]))
+```
+
+### Решение 5.3
+
+```python
+from sklearn.datasets import load_iris
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import GridSearchCV, train_test_split
+from joblib import dump
+import time
+
+iris = load_iris()
+X_train, X_test, y_train, y_test = train_test_split(
+    iris.data, iris.target, test_size=0.2, random_state=42
+)
+
+param_grid = {
+    'n_estimators': [50, 100],
+    'max_depth': [3, 5, None]
+}
+
+# С n_jobs=1
+search1 = GridSearchCV(
+    RandomForestClassifier(random_state=42),
+    param_grid, cv=3, n_jobs=1
+)
+t0 = time.time()
+search1.fit(X_train, y_train)
+t1 = time.time() - t0
+
+# С n_jobs=-1
+search2 = GridSearchCV(
+    RandomForestClassifier(random_state=42),
+    param_grid, cv=3, n_jobs=-1
+)
+t0 = time.time()
+search2.fit(X_train, y_train)
+t2 = time.time() - t0
+
+print(f"n_jobs=1: {t1:.2f} сек")
+print(f"n_jobs=-1: {t2:.2f} сек")
+print(f"Ускорение: {t1/t2:.1f}x")
+print("Лучшие параметры:", search2.best_params_)
+
+dump(search2.best_estimator_, 'grid_best.joblib', compress=3)
+```
+
+---
+
+## 9. Вопросы для самопроверки
+
+1. **Зачем нужен `Pipeline` в sklearn?**  
+   *(Ответ: чтобы объединить шаги предобработки и модель в один объект, гарантируя, что при обучении и предсказании шаги выполняются в одном порядке.)*
+
+2. **Что происходит под капотом, когда вы пишете `RandomForestClassifier(n_jobs=-1)`?**  
+   *(Ответ: sklearn создаёт внутри `joblib.Parallel` и обучает деревья параллельно в разных процессах.)*
+
+3. **Почему нельзя использовать `lambda` в `FunctionTransformer`, если планируется сохранять Pipeline?**  
+   *(Ответ: `lambda`-функции не сериализуются `pickle`/`joblib`, потому что у них нет имени, по которому можно восстановить код.)*
+
+4. **Что сохраняется внутри `GridSearchCV`, и почему лучше сохранять `best_estimator_`?**  
+   *(Ответ: `GridSearchCV` хранит все обученные модели (в `cv_results_`), что занимает много места. `best_estimator_` — это только лучшая модель, компактнее.)*
+
+5. **Почему опасно оборачивать `GridSearchCV(n_jobs=-1)` в свой `joblib.Parallel(n_jobs=-1)`?**  
+   *(Ответ: получается вложенный параллелизм: внешние процессы создают внутренние процессы. Это перегружает систему и замедляет выполнение.)*
+
+6. **Что нужно сделать при загрузке Pipeline с кастомным трансформером в другом скрипте?**  
+   *(Ответ: импортировать класс кастомного трансформера до вызова `load()`, иначе `joblib` не сможет восстановить объект.)*
+
+---
+
+## Итоги модуля
+
+- **`Pipeline`** объединяет предобработку и модель в единый объект. Сохраняя Pipeline через `joblib`, вы сохраняете весь ML-процесс целиком.
+- **`sklearn` активно использует `joblib` под капотом**: параметр `n_jobs` в моделях и `GridSearchCV` — это обёртка над `joblib.Parallel`.
+- **Кастомные трансформеры** должны наследоваться от `BaseEstimator` и `TransformerMixin`, не использовать `lambda`, и их класс должен быть доступен при загрузке.
+- **`GridSearchCV` и `RandomizedSearchCV`** с `n_jobs=-1` ускоряют перебор гиперпараметров в несколько раз, но не должны вкладываться в другой `Parallel`.
+- В production сохраняйте `best_estimator_` или готовый Pipeline — это защищает от ошибок несоответствия формата данных и упрощает деплой.
+
+**В следующем модуле** мы выйдем в production: научимся встраивать `joblib` в backend-приложения, организовывать загрузку моделей при старте сервера и делать batch inference.

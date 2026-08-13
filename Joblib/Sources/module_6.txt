@@ -1,0 +1,657 @@
+  # Модуль 6. От ноутбука до production: `joblib` в backend-приложениях
+
+---
+
+## Зачем этот модуль
+
+В предыдущих модулях мы работали в **ноутбуках и скриптах**: обучали модель, сохраняли в файл, загружали в другом скрипте. Это удобно для экспериментов, но в реальном мире модель должна работать иначе.
+
+Представьте приложение, которое:
+- работает 24 часа в сутки;
+- получает запросы от пользователей через интернет;
+- должно отвечать за миллисекунды, а не минуты;
+- обслуживает сотни или тысячи людей одновременно.
+
+Это и есть **backend** (серверная часть). В этом модуле мы научимся встраивать модели, сохранённые через `joblib`, в настоящий веб-сервис. Разберём, как правильно загружать модель при старте сервера, как принимать запросы и возвращать предсказания, как организовать версионирование и не потерять контроль над артефактами.
+
+---
+
+## 1. Что меняется, когда модель выходит в production
+
+### Ноутбук vs Сервер
+
+| Ноутбук | Сервер (backend) |
+|---------|-----------------|
+| Запускаем скрипт руками | Приложение работает постоянно |
+| Загружаем модель перед каждым экспериментом | Модель загружается **один раз** при старте |
+| Предсказываем для себя | Предсказываем для тысяч пользователей |
+| Ошибка — перезапустили ячейку | Ошибка — упал сервис, недовольные клиенты |
+| Главное — точность | Главное — скорость ответа, стабильность, контроль версий |
+
+### Что такое API простыми словами
+
+**API** (Application Programming Interface) — это «окно заказа» в ресторане. Клиент (пользователь или другое приложение) подходит к окну, говорит, что хочет (отправляет **запрос**). Кухня (сервер) готовит блюдо (модель делает предсказание). Официант несёт готовое блюдо клиенту (возвращает **ответ**).
+
+Клиент не знает, что происходит на кухне. Он не лезет к плите — он просто заказывает через окно. Так и с API: пользователь отправляет данные (например, характеристики ириса), сервер возвращает предсказание (какой это вид), не раскрывая внутреннего устройства модели.
+
+---
+
+## 2. Архитектура простого ML-сервиса
+
+### Модель как singleton
+
+**Singleton** (одиночка) — это паттерн программирования, при котором объект существует в программе **в единственном экземпляре**.
+
+В нашем случае модель должна быть singleton: загрузилась **один раз** при старте сервера, и все запросы используют этот один объект. Если загружать модель заново на каждый запрос — сервер умрёт под нагрузкой.
+
+### Почему нельзя грузить модель внутри endpoint
+
+```python
+# ПЛОХО: модель грузится на КАЖДЫЙ запрос
+@app.post("/predict")
+def predict(features):
+    model = load('model.joblib')  # 2 секунды на каждый запрос!
+    return model.predict(features)
+```
+
+Если 100 пользователей обратятся одновременно — сервер 200 секунд будет только грузить модели, не успевая отвечать.
+
+### Правильный подход: загрузка при старте
+
+```python
+# ХОРОШО: модель загружена один раз
+model = load('model.joblib')
+
+@app.post("/predict")
+def predict(features):
+    return model.predict(features)  # мгновенно, модель уже в памяти
+```
+
+### FastAPI: современный инструмент для backend
+
+Мы будем использовать **FastAPI** — фреймворк для создания API на Python. Он быстрый, простой и автоматически проверяет типы данных.
+
+Установка:
+```bash
+pip install fastapi uvicorn
+```
+
+- **FastAPI** — библиотека, которая помогает описывать endpoint'ы (адреса, куда можно обращаться).
+- **Uvicorn** — сервер, который запускает приложение и слушает интернет-запросы.
+
+---
+
+## 3. Базовый сервис: загрузка модели и предсказание
+
+### Структура проекта
+
+```
+my_ml_service/
+├── main.py              # код сервера
+├── model.joblib         # сохранённая модель (из предыдущих модулей)
+└── requirements.txt     # зависимости
+```
+
+### Код `main.py`
+
+```python
+from fastapi import FastAPI
+from pydantic import BaseModel
+from joblib import load
+import numpy as np
+
+# ========== 1. ЗАГРУЗКА МОДЕЛИ ПРИ СТАРТЕ ==========
+print("Загрузка модели...")
+model = load('model.joblib')
+print("Модель загружена!")
+
+# ========== 2. СОЗДАНИЕ ПРИЛОЖЕНИЯ ==========
+app = FastAPI(title="ML Prediction Service")
+
+# ========== 3. ОПИСАНИЕ ФОРМАТА ЗАПРОСА ==========
+class PredictRequest(BaseModel):
+    features: list[float]  # список чисел, например [5.1, 3.5, 1.4, 0.2]
+
+# ========== 4. ENDPOINT ДЛЯ ПРЕДСКАЗАНИЯ ==========
+@app.post("/predict")
+def predict(request: PredictRequest):
+    """
+    Принимает список признаков, возвращает предсказание модели.
+    """
+    # Превращаем список в numpy-массив (модель ожидает массив)
+    X = np.array([request.features])
+    
+    # Предсказание
+    prediction = model.predict(X)
+    
+    # Возвращаем результат
+    return {
+        "prediction": int(prediction[0]),
+        "model_type": type(model).__name__
+    }
+
+# ========== 5. ENDPOINT ДЛЯ ПРОВЕРКИ ЗДОРОВЬЯ ==========
+@app.get("/health")
+def health():
+    """Проверка, что сервер жив."""
+    return {"status": "ok", "model_loaded": model is not None}
+```
+
+### Запуск сервера
+
+```bash
+uvicorn main:app --reload --host 0.0.0.0 --port 8000
+```
+
+- `main:app` — файл `main.py`, объект `app`;
+- `--reload` — перезагружать при изменении кода (только для разработки!);
+- `--host 0.0.0.0` — слушать все сетевые интерфейсы;
+- `--port 8000` — порт.
+
+### Как протестировать
+
+Откройте браузер или используйте `curl`:
+
+```bash
+curl -X POST "http://localhost:8000/predict" \
+     -H "Content-Type: application/json" \
+     -d '{"features": [5.1, 3.5, 1.4, 0.2]}'
+```
+
+Ответ:
+```json
+{
+    "prediction": 0,
+    "model_type": "Pipeline"
+}
+```
+
+### Важный нюанс: `def` vs `async def`
+
+В FastAPI endpoint можно писать двумя способами:
+
+```python
+@app.post("/predict")
+def predict(request): ...        # FastAPI запустит в отдельном потоке
+
+@app.post("/predict")
+async def predict(request): ...  # асинхронная функция, не создаёт поток
+```
+
+Для ML-предсказаний (`model.predict`) используйте **`def`**, а не `async def`. Почему? `model.predict` — это **CPU-bound** операция (вычисления). Если написать `async def`, вычисление заблокирует главный цикл сервера, и другие запросы встанут в очередь. `def` заставит FastAPI выполнить предсказание в отдельном потоке, не мешая остальным клиентам.
+
+---
+
+## 4. Batch inference: предсказание на множестве объектов
+
+### Зачем batch endpoint
+
+Пользователь может прислать не одну строчку, а тысячу. Если вызывать `predict` в цикле — медленно. Лучше дать модели массив сразу.
+
+### Код batch endpoint
+
+```python
+class BatchPredictRequest(BaseModel):
+    data: list[list[float]]  # список списков: [[...], [...], ...]
+
+@app.post("/predict_batch")
+def predict_batch(request: BatchPredictRequest):
+    """
+    Принимает массив данных, возвращает массив предсказаний.
+    """
+    X = np.array(request.data)
+    predictions = model.predict(X)
+    
+    return {
+        "predictions": predictions.tolist(),
+        "count": len(predictions)
+    }
+```
+
+Тест:
+```bash
+curl -X POST "http://localhost:8000/predict_batch" \
+     -H "Content-Type: application/json" \
+     -d '{"data": [[5.1, 3.5, 1.4, 0.2], [6.2, 3.4, 5.4, 2.3]]}'
+```
+
+### Batch + Parallel для огромных массивов
+
+Если пользователь присылает 100 000 строк, а модель тяжёлая, можно разбить на чанки и обработать параллельно (как в Модуле 4). Но **осторожно**: создавать процессы на каждый HTTP-запрос — дорого.
+
+Лучше: если данных больше порога — параллелим, если меньше — просто `predict`.
+
+```python
+from joblib import Parallel, delayed
+
+@app.post("/predict_batch")
+def predict_batch(request: BatchPredictRequest):
+    X = np.array(request.data)
+    
+    # Если мало данных — просто предсказываем
+    if len(X) < 1000:
+        predictions = model.predict(X)
+    else:
+        # Разбиваем на чанки и параллелим
+        chunk_size = 500
+        chunks = [X[i:i+chunk_size] for i in range(0, len(X), chunk_size)]
+        
+        predictions_list = Parallel(n_jobs=4)(
+            delayed(lambda c: model.predict(c))(chunk) for chunk in chunks
+        )
+        predictions = np.concatenate(predictions_list)
+    
+    return {"predictions": predictions.tolist()}
+```
+
+> **Backend-правило:** `Parallel` внутри HTTP-запроса — это компромисс. Для высоконагруженных систем лучше использовать очереди задач (Celery, RQ), но для учебного сервиса и средних нагрузок такой подход работает.
+
+---
+
+## 5. Версионирование артефактов
+
+### Проблема: «какая модель сейчас работает?»
+
+Через месяц после деплоя вы обучили новую модель. Как её внедрить, не сломав старый сервис? Как откатиться назад, если новая модель хуже?
+
+### Решение: структура папок с версиями
+
+```
+models/
+├── 20260813_143000/
+│   ├── model.joblib
+│   └── metadata.json
+├── 20260820_100000/
+│   ├── model.joblib
+│   └── metadata.json
+└── current -> 20260820_100000/   # симлинк или конфиг
+```
+
+### Код версионирования
+
+```python
+import os
+from datetime import datetime
+from joblib import dump
+
+MODEL_DIR = './models'
+
+def save_versioned_model(pipeline, metrics):
+    """Сохраняет модель с таймстампом и метаданными."""
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    version_dir = os.path.join(MODEL_DIR, timestamp)
+    os.makedirs(version_dir, exist_ok=True)
+    
+    # Сохраняем модель
+    model_path = os.path.join(version_dir, 'model.joblib')
+    dump(pipeline, model_path, compress=3)
+    
+    # Сохраняем метаданные отдельно (чтобы не грузить модель для просмотра)
+    metadata = {
+        'version': timestamp,
+        'metrics': metrics,
+        'saved_at': datetime.now().isoformat()
+    }
+    
+    import json
+    with open(os.path.join(version_dir, 'metadata.json'), 'w') as f:
+        json.dump(metadata, f, indent=2)
+    
+    return version_dir
+
+# Использование
+version_path = save_versioned_model(pipeline, {'accuracy': 0.95})
+print(f"Модель сохранена в: {version_path}")
+```
+
+### Загрузка конкретной версии
+
+```python
+import json
+
+def load_model_version(version=None):
+    """
+    Если version=None — загружает самую свежую версию.
+    Иначе — конкретную.
+    """
+    if version is None:
+        versions = sorted(os.listdir(MODEL_DIR))
+        version = versions[-1]
+    
+    model_path = os.path.join(MODEL_DIR, version, 'model.joblib')
+    
+    # Проверяем метаданные
+    meta_path = os.path.join(MODEL_DIR, version, 'metadata.json')
+    with open(meta_path) as f:
+        metadata = json.load(f)
+    print(f"Загружена версия {metadata['version']}, accuracy: {metadata['metrics']['accuracy']}")
+    
+    return load(model_path)
+```
+
+### Переключение версий без остановки сервера
+
+Можно сделать endpoint для «горячей» смены модели:
+
+```python
+@app.post("/admin/switch_model")
+def switch_model(version: str):
+    global model
+    model = load_model_version(version)
+    return {"message": f"Модель переключена на {version}"}
+```
+
+---
+
+## 6. Логирование и фиксация зависимостей
+
+### Почему это важно
+
+Вы сохранили модель сегодня. Через полгода загружаете — и получаете ошибку. Почему? Версия `sklearn` обновилась, и структура объектов изменилась.
+
+### Что фиксировать
+
+```python
+import sys
+import sklearn
+import joblib
+import numpy as np
+
+metadata = {
+    'model': pipeline,
+    'versions': {
+        'python': sys.version,
+        'sklearn': sklearn.__version__,
+        'joblib': joblib.__version__,
+        'numpy': np.__version__
+    },
+    'training_date': datetime.now().isoformat(),
+    'dataset_hash': 'abc123'  # хеш данных, если есть
+}
+
+dump(metadata, 'model_with_versions.joblib', compress=3)
+```
+
+### `requirements.txt`
+
+Рядом с моделью всегда должен быть файл зависимостей:
+
+```bash
+pip freeze > requirements.txt
+```
+
+Содержимое:
+```
+fastapi==0.111.0
+uvicorn==0.30.0
+scikit-learn==1.5.0
+joblib==1.4.0
+numpy==1.26.0
+pydantic==2.7.0
+```
+
+### Проверка совместимости при загрузке
+
+```python
+import sklearn
+import warnings
+
+def load_model_safe(path):
+    artifacts = load(path)
+    
+    saved_sklearn = artifacts.get('versions', {}).get('sklearn')
+    current_sklearn = sklearn.__version__
+    
+    if saved_sklearn != current_sklearn:
+        warnings.warn(
+            f"Версия sklearn отличается: "
+            f"сохранена с {saved_sklearn}, сейчас {current_sklearn}. "
+            f"Модель может работать некорректно!"
+        )
+    
+    return artifacts['model']
+```
+
+---
+
+## 7. Полный production-ready пример
+
+```python
+"""
+main.py — полноценный ML-сервис на FastAPI + joblib
+"""
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from joblib import load
+import numpy as np
+import json
+import os
+from datetime import datetime
+
+# ========== КОНФИГУРАЦИЯ ==========
+MODEL_DIR = os.getenv('MODEL_DIR', './models')
+MODEL_VERSION = os.getenv('MODEL_VERSION', None)  # можно задать через переменную окружения
+
+# ========== ЗАГРУЗКА МОДЕЛИ ==========
+def load_latest_model():
+    """Находит и загружает последнюю версию модели."""
+    if MODEL_VERSION:
+        version_dir = os.path.join(MODEL_DIR, MODEL_VERSION)
+    else:
+        versions = [d for d in sorted(os.listdir(MODEL_DIR)) 
+                   if os.path.isdir(os.path.join(MODEL_DIR, d))]
+        if not versions:
+            raise RuntimeError("Не найдено ни одной версии модели!")
+        version_dir = os.path.join(MODEL_DIR, versions[-1])
+    
+    model_path = os.path.join(version_dir, 'model.joblib')
+    meta_path = os.path.join(version_dir, 'metadata.json')
+    
+    print(f"[{datetime.now()}] Загрузка модели из {version_dir}...")
+    model = load(model_path)
+    
+    if os.path.exists(meta_path):
+        with open(meta_path) as f:
+            metadata = json.load(f)
+        print(f"Версия: {metadata['version']}, метрики: {metadata['metrics']}")
+    else:
+        metadata = {}
+    
+    return model, metadata
+
+model, model_meta = load_latest_model()
+
+# ========== ПРИЛОЖЕНИЕ ==========
+app = FastAPI(
+    title="Iris ML API",
+    version="1.0.0",
+    description="Сервис предсказаний на основе joblib-модели"
+)
+
+# ========== МОДЕЛИ ДАННЫХ ==========
+class PredictRequest(BaseModel):
+    features: list[float]
+
+class BatchPredictRequest(BaseModel):
+    data: list[list[float]]
+
+# ========== ENDPOINTS ==========
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "model_loaded": True,
+        "model_version": model_meta.get("version", "unknown")
+    }
+
+@app.post("/predict")
+def predict(request: PredictRequest):
+    try:
+        X = np.array([request.features])
+        pred = model.predict(X)
+        proba = model.predict_proba(X) if hasattr(model, 'predict_proba') else None
+        
+        response = {"prediction": int(pred[0])}
+        if proba is not None:
+            response["probabilities"] = proba[0].tolist()
+        
+        return response
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/predict_batch")
+def predict_batch(request: BatchPredictRequest):
+    try:
+        X = np.array(request.data)
+        preds = model.predict(X)
+        return {
+            "predictions": preds.tolist(),
+            "count": len(preds)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/model/info")
+def model_info():
+    return {
+        "version": model_meta.get("version"),
+        "metrics": model_meta.get("metrics"),
+        "pipeline_steps": list(model.named_steps.keys()) if hasattr(model, 'named_steps') else []
+    }
+```
+
+Запуск в production:
+```bash
+MODEL_DIR=./models uvicorn main:app --host 0.0.0.0 --port 8000 --workers 2
+```
+
+- `--workers 2` — запустить 2 процесса uvicorn, чтобы обрабатывать запросы параллельно.
+
+---
+
+## 8. Практика: задания
+
+### Задание 6.1: «Первый ML-сервис»
+
+1. Возьмите обученный Pipeline из Модуля 5 (Iris).
+2. Сохраните его в файл `model.joblib`.
+3. Создайте `main.py` с FastAPI-приложением:
+   - загрузка модели при старте;
+   - endpoint `POST /predict`, принимающий `{"features": [...]}`;
+   - endpoint `GET /health`.
+4. Запустите сервер через `uvicorn`.
+5. Протестируйте оба endpoint через `curl` или браузер (`/docs`).
+
+### Задание 6.2: «Batch-предсказания»
+
+1. Добавьте endpoint `POST /predict_batch`.
+2. Он должен принимать `{"data": [[...], [...], ...]}`.
+3. Возвращать список предсказаний и их количество.
+4. Протестируйте на 5–10 примерах за один запрос.
+
+### Задание 6.3: «Версионирование»
+
+1. Создайте функцию `save_versioned_model(pipeline, metrics)`.
+2. Сохраните две «версии» модели в разные папки с таймстампом.
+3. Создайте `load_model_version(version)` для загрузки конкретной версии.
+4. Добавьте endpoint `GET /model/info`, который показывает версию и метрики загруженной модели.
+
+### Задание 6.4: «Защита от несовместимости»
+
+1. При сохранении модели запишите версии `sklearn`, `joblib`, `python` в метаданные.
+2. При загрузке сравните сохранённую версию `sklearn` с текущей.
+3. Если версии не совпадают — выведите предупреждение (warning), но всё равно загрузите модель.
+
+---
+
+## 9. Эталонные решения
+
+### Решение 6.1
+
+```python
+from fastapi import FastAPI
+from pydantic import BaseModel
+from joblib import load
+import numpy as np
+
+model = load('model.joblib')
+app = FastAPI()
+
+class PredictRequest(BaseModel):
+    features: list[float]
+
+@app.post("/predict")
+def predict(request: PredictRequest):
+    X = np.array([request.features])
+    pred = model.predict(X)
+    return {"prediction": int(pred[0])}
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+```
+
+### Решение 6.3 (фрагмент)
+
+```python
+import os
+from datetime import datetime
+from joblib import dump, load
+import json
+
+MODEL_DIR = './models'
+
+def save_versioned_model(pipeline, metrics):
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    vdir = os.path.join(MODEL_DIR, ts)
+    os.makedirs(vdir, exist_ok=True)
+    
+    dump(pipeline, os.path.join(vdir, 'model.joblib'), compress=3)
+    
+    meta = {'version': ts, 'metrics': metrics, 'date': datetime.now().isoformat()}
+    with open(os.path.join(vdir, 'metadata.json'), 'w') as f:
+        json.dump(meta, f)
+    
+    return vdir
+
+def load_model_version(version):
+    path = os.path.join(MODEL_DIR, version, 'model.joblib')
+    return load(path)
+```
+
+---
+
+## 10. Вопросы для самопроверки
+
+1. **Почему модель загружается при старте сервера, а не внутри endpoint?**  
+   *(Ответ: чтобы не тратить время на загрузку файла на каждый запрос. Модель весит много, а запросов может быть тысячи в минуту.)*
+
+2. **Что такое singleton в контексте ML-сервиса?**  
+   *(Ответ: объект, который существует в единственном экземпляре на всё время работы приложения — в нашем случае, одна загруженная модель для всех запросов.)*
+
+3. **Почему для ML-endpoint лучше использовать `def`, а не `async def`?**  
+   *(Ответ: `model.predict` — блокирующая CPU-операция. `async def` заблокирует event loop сервера, а `def` выполнится в отдельном потоке, не мешая другим запросам.)*
+
+4. **Зачем версионировать модели с таймстампом?**  
+   *(Ответ: чтобы можно было откатиться к старой версии, сравнивать метрики разных версий и не перезаписывать рабочую модель случайно.)*
+
+5. **Что должно быть в `requirements.txt` рядом с `.joblib`-моделью?**  
+   *(Ответ: точные версии библиотек, с которыми модель создавалась и тестировалась: `scikit-learn`, `joblib`, `numpy` и т.д.)*
+
+6. **Когда имеет смысл использовать `Parallel` внутри batch endpoint?**  
+   *(Ответ: только при очень большом количестве входных данных (тысячи строк), где накладные расходы на создание процессов окупаются. Для маленьких батчей — обычный `predict` быстрее.)*
+
+---
+
+## Итоги модуля
+
+- **Backend** — это постоянно работающее приложение, которое принимает запросы и возвращает предсказания.
+- Модель должна быть **singleton**: загружена **один раз** при старте, а не на каждый запрос.
+- **FastAPI** + `joblib.load()` — простая и мощная комбинация для ML-сервисов.
+- Для CPU-bound операций (`predict`) используйте **`def`**, чтобы не блокировать event loop.
+- **Batch endpoint** принимает массив данных и возвращает массив предсказаний.
+- **Версионирование** с таймстампом и метаданными спасает от хаоса в production.
+- Всегда фиксируйте версии библиотек (`requirements.txt`) и проверяйте совместимость при загрузке.
+
+**В следующем модуле** мы подведём итоги: разберём, когда `joblib` — лучший выбор, а когда стоит искать альтернативы, и составим чек-лист для деплоя ML-моделей.
