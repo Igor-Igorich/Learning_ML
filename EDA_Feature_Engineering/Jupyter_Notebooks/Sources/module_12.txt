@@ -1,0 +1,436 @@
+# 📘 Модуль 12. Отбор признаков (Feature Selection)
+## Подробный конспект
+
+---
+
+### 12.1. Зачем отбирать признаки
+
+После EDA, очистки и Feature Engineering у вас может оказаться **50, 100 или даже 1000 признаков**. Не все они одинаково полезны. Некоторые шумят, дублируют друг друга или просто не несут информации о целевой переменной.
+
+**Проклятие размерности (Curse of Dimensionality):**
+- С ростом числа признаков объём данных «разрежается». Для покрытия пространства нужно экспоненциально больше данных.
+- Модель начинает запоминать шум вместо закономерностей — **переобучение**.
+- Вычисления становятся медленнее: обучение, предсказание, поиск гиперпараметров.
+
+**Почему меньше иногда лучше:**
+- **Скорость:** модель на 10 признаках обучается за секунды, на 1000 — за минуты.
+- **Интерпретируемость:** объяснить заказчику 5 факторов риска проще, чем 200.
+- **Качество:** удаление шумовых признаков уменьшает переобучение и улучшает обобщение.
+- **Стоимость:** в продакшене дешевле считать 10 признаков, чем собирать и считать 200.
+
+---
+
+### 12.2. Три семейства методов отбора
+
+| Семейство | Принцип | Скорость | Устойчивость | Пример |
+|-----------|---------|----------|--------------|--------|
+| **Filter** | Оценивает каждый признак **в отдельности** по статистике | Очень быстро | Высокая | Корреляция, Mutual Information |
+| **Wrapper** | Оценивает **подмножество** признаков по качеству модели | Медленно | Средняя | RFE, Forward Selection |
+| **Embedded** | Отбор **встроен** в процесс обучения модели | Быстро | Высокая | Lasso, важность деревьев |
+
+---
+
+### 12.3. Фильтрационные методы (Filter Methods)
+
+Оценивают признаки независимо от модели. Быстрые, но не учитывают взаимодействия между признаками.
+
+#### 12.3.1. Variance Threshold (порог дисперсии)
+
+Удаляет признаки, которые почти не меняются (константные или почти константные).
+
+```python
+from sklearn.feature_selection import VarianceThreshold
+import numpy as np
+
+# Данные: второй столбец почти константный (все 5)
+X = np.array([[1, 5, 3],
+              [2, 5, 7],
+              [3, 5, 2],
+              [4, 5, 9]])
+
+selector = VarianceThreshold(threshold=0.1)  # минимальная дисперсия
+X_selected = selector.fit_transform(X)
+
+print(X_selected)  # второй столбец удалён
+print(f"Оставшиеся индексы: {selector.get_support(indices=True)}")
+```
+
+**Когда использовать:** как первый шаг — убрать явный мусор.
+
+---
+
+#### 12.3.2. Корреляция с целевой переменной
+
+Оставляем признаки, сильнее всего коррелирующие с таргетом (см. Модуль 4).
+
+```python
+import pandas as pd
+from sklearn.feature_selection import SelectKBest, f_regression
+
+# Для регрессии: F-статистика (ANOVA F-value)
+selector = SelectKBest(score_func=f_regression, k=5)
+X_new = selector.fit_transform(X_train, y_train)
+
+# Посмотреть баллы
+scores = pd.Series(selector.scores_, index=feature_names)
+print(scores.sort_values(ascending=False))
+```
+
+---
+
+#### 12.3.3. Mutual Information (Взаимная информация)
+
+Измеряет **любую** статистическую зависимость (не только линейную). Хорош для нелинейных связей.
+
+```python
+from sklearn.feature_selection import mutual_info_classif, mutual_info_regression
+
+# Для классификации
+mi = mutual_info_classif(X_train, y_train, random_state=42)
+mi_scores = pd.Series(mi, index=feature_names).sort_values(ascending=False)
+
+print(mi_scores.head(10))
+```
+
+**Интерпретация:** чем выше MI, тем больше информации о таргете содержится в признаке. 0 = признак не несёт информации.
+
+---
+
+#### 12.3.4. Хи-квадрат (Chi-Square)
+
+Для **категориальных** признаков и **категориального** таргета. Проверяет, независимы ли распределения.
+
+```python
+from sklearn.feature_selection import chi2
+
+# Требует неотрицательных значений!
+scores, p_values = chi2(X_train, y_train)
+
+chi2_scores = pd.Series(scores, index=feature_names).sort_values(ascending=False)
+print(chi2_scores.head())
+```
+
+**Когда использовать:** признаки — частоты или счёты (Bag of Words, количество событий), таргет — класс.
+
+---
+
+#### 12.3.5. ANOVA F-test
+
+Для **числовых** признаков и **категориального** таргета. Проверяет, различаются ли средние значения признака между классами.
+
+```python
+from sklearn.feature_selection import f_classif
+
+f_scores, p_values = f_classif(X_train, y_train)
+```
+
+---
+
+### 12.4. Wrapper методы
+
+Обёртка вокруг модели: перебираем подмножества признаков и смотрим, как меняется качество.
+
+#### 12.4.1. Recursive Feature Elimination (RFE)
+
+**Идея:**
+1. Обучаем модель на всех признаках.
+2. Смотрим важность каждого признака (коэффициенты или feature_importances_).
+3. Удаляем самый слабый признак.
+4. Повторяем, пока не останется нужное число.
+
+```python
+from sklearn.feature_selection import RFE
+from sklearn.linear_model import LogisticRegression
+
+model = LogisticRegression(max_iter=1000, random_state=42)
+
+# Оставим 10 лучших признаков
+rfe = RFE(estimator=model, n_features_to_select=10, step=1)
+rfe.fit(X_train, y_train)
+
+# Маска отобранных признаков
+selected_features = X_train.columns[rfe.support_]
+print(f"Отобрано: {list(selected_features)}")
+
+# Ранжирование всех признаков (1 = выбран, 2 = следующий и т.д.)
+print(rfe.ranking_)
+```
+
+**Параметр `step`:** сколько признаков удалять за итерацию. `step=0.1` — удалять 10% за шаг (быстрее).
+
+---
+
+#### 12.4.2. RFECV (RFE с кросс-валидацией)
+
+Автоматически подбирает **оптимальное число** признаков, проверяя качество на кросс-валидации.
+
+```python
+from sklearn.feature_selection import RFECV
+
+rfecv = RFECV(
+    estimator=model,
+    step=1,
+    cv=5,
+    scoring='roc_auc',
+    n_jobs=-1
+)
+rfecv.fit(X_train, y_train)
+
+print(f"Оптимальное число признаков: {rfecv.n_features_}")
+print(f"Отобраны: {X_train.columns[rfecv.support_]}")
+
+# График качества vs число признаков
+import matplotlib.pyplot as plt
+plt.plot(range(1, len(rfecv.cv_results_['mean_test_score']) + 1), 
+         rfecv.cv_results_['mean_test_score'])
+plt.xlabel('Число признаков')
+plt.ylabel('ROC-AUC')
+plt.title('RFECV')
+plt.show()
+```
+
+---
+
+#### 12.4.3. Forward Selection (прямой отбор)
+
+**Идея:** начинаем с пустого набора и по одному добавляем признаки, дающие наибольший прирост качества.
+
+```python
+# В sklearn нет прямой реализации, но есть в mlxtend
+# pip install mlxtend
+from mlxtend.feature_selection import SequentialFeatureSelector as SFS
+
+sfs = SFS(model, 
+          k_features=10,        # сколько оставить
+          forward=True,         # прямой отбор
+          floating=False, 
+          scoring='roc_auc',
+          cv=3,
+          n_jobs=-1)
+
+sfs.fit(X_train, y_train)
+print(f"Отобраны: {sfs.k_feature_names_}")
+```
+
+**Forward vs Backward:**
+- **Forward:** быстрее, когда полезных признаков мало.
+- **Backward (RFE):** быстрее, когда шумовых признаков мало.
+
+---
+
+### 12.5. Embedded методы
+
+Отбор происходит **во время обучения** модели. Модель сама решает, какие признаки важны.
+
+#### 12.5.1. Lasso (L1-регуляризация)
+
+Lasso добавляет штраф за **абсолютные значения** коэффициентов. Неполезные признаки получают коэффициент **ровно 0** — их можно отбросить.
+
+```python
+from sklearn.linear_model import Lasso, LogisticRegression
+
+# Для регрессии
+lasso = Lasso(alpha=0.01, random_state=42)
+lasso.fit(X_train, y_train)
+
+# Признаки с ненулевыми коэффициентами
+selected = X_train.columns[np.abs(lasso.coef_) > 0]
+print(f"Оставлено Lasso: {len(selected)} из {X_train.shape[1]}")
+
+# Для классификации — LogisticRegression с L1
+logreg_l1 = LogisticRegression(penalty='l1', solver='liblinear', 
+                               C=0.1, random_state=42)
+logreg_l1.fit(X_train, y_train)
+selected_l1 = X_train.columns[np.abs(logreg_l1.coef_[0]) > 0]
+```
+
+**Параметр `alpha` (или `C`):**
+- Больше alpha → сильнее штраф → меньше признаков.
+- Меньше alpha → слабее штраф → больше признаков.
+
+---
+
+#### 12.5.2. Важность признаков в деревьях
+
+Деревья решений, Random Forest, XGBoost, LightGBM вычисляют `feature_importances_` — насколько каждый признак уменьшил неопределённость (impurity).
+
+```python
+from sklearn.ensemble import RandomForestClassifier
+
+rf = RandomForestClassifier(n_estimators=100, random_state=42)
+rf.fit(X_train, y_train)
+
+importances = pd.Series(rf.feature_importances_, index=X_train.columns)
+print(importances.sort_values(ascending=False).head(10))
+
+# Отбор топ-N
+top_features = importances.nlargest(20).index
+X_train_selected = X_train[top_features]
+```
+
+> **Важно:** встроенная `feature_importances_` в деревьях может быть **смещена** в сторону признаков с большим числом уникальных значений (cardinality bias). Для надёжности используйте Permutation Importance.
+
+---
+
+#### 12.5.3. Permutation Importance (Важность перестановки)
+
+**Идея:** перемешиваем значения одного признака в тестовой выборке и смотрим, насколько упало качество модели. Если качество почти не упало — признак неважен.
+
+```python
+from sklearn.inspection import permutation_importance
+
+# Модель уже обучена
+result = permutation_importance(rf, X_test, y_test, 
+                                n_repeats=10, random_state=42, n_jobs=-1)
+
+perm_importances = pd.Series(result.importances_mean, index=X_train.columns)
+print(perm_importances.sort_values(ascending=False).head(10))
+```
+
+**Плюсы:** не смещена по cardinality, работает с любой моделью, учитывает взаимодействия.
+**Минусы:** медленнее, чем встроенные importance.
+
+---
+
+### 12.6. Сравнение подходов
+
+| Критерий | Filter | Wrapper | Embedded |
+|----------|--------|---------|----------|
+| **Скорость** | ⚡ Мгновенно | 🐢 Медленно | ⚡ Быстро |
+| **Учёт взаимодействий** | ❌ Нет | ✅ Да | ⚠️ Частично |
+| **Переобучение** | ❌ Нет | ⚠️ Возможно | ❌ Нет |
+| **Зависимость от модели** | ❌ Нет | ✅ Да | ✅ Да |
+| **Рекомендуемый этап** | Первичный отбор | Финальная доводка | В процессе обучения |
+
+**Практическая стратегия:**
+1. **Filter:** уберите явный мусор (VarianceThreshold, низкая корреляция с таргетом).
+2. **Embedded:** обучите Lasso или Random Forest, отбросьте нулевые/слабые признаки.
+3. **Wrapper:** если нужно максимальное качество — доведите RFECV.
+
+---
+
+### 12.7. Практический пример: полный цикл отбора
+
+```python
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.feature_selection import (VarianceThreshold, SelectKBest, 
+                                       mutual_info_classif, RFE, RFECV)
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.inspection import permutation_importance
+from sklearn.metrics import roc_auc_score
+
+np.random.seed(42)
+
+# Создаём данные: 50 признаков, из которых полезны только 5
+n = 1000
+X = pd.DataFrame(np.random.randn(n, 50), columns=[f'f_{i}' for i in range(50)])
+
+# Полезные признаки: f_0, f_1, f_2, f_3, f_4
+y = (X['f_0'] * 2 + X['f_1'] * -1 + X['f_2'] * 0.5 + 
+     np.random.randn(n) * 0.5 > 0).astype(int)
+
+# Шумовые признаки дублируют полезные (мультиколлинеарность)
+X['f_50'] = X['f_0'] + np.random.randn(n) * 0.01
+X['f_51'] = X['f_1'] * 2  # линейная комбинация
+
+# Почти константный признак
+X['f_52'] = 5 + np.random.randn(n) * 0.001
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# === ШАГ 1: VARIANCE THRESHOLD ===
+vt = VarianceThreshold(threshold=0.01)
+X_train_vt = vt.fit_transform(X_train)
+X_test_vt = vt.transform(X_test)
+removed_vt = X_train.columns[~vt.get_support()]
+print(f"Удалено VarianceThreshold: {list(removed_vt)} (почти константы)")
+
+# Возвращаем в DataFrame
+X_train = X_train[X_train.columns[vt.get_support()]]
+X_test = X_test[X_test.columns[vt.get_support()]]
+
+# === ШАГ 2: MUTUAL INFORMATION (Filter) ===
+mi = mutual_info_classif(X_train, y_train, random_state=42)
+mi_scores = pd.Series(mi, index=X_train.columns).sort_values(ascending=False)
+
+# Оставим топ-20 по MI
+top_mi = mi_scores.head(20).index
+X_train_mi = X_train[top_mi]
+X_test_mi = X_test[top_mi]
+
+print(f"\nТоп-5 по Mutual Information:\n{mi_scores.head()}")
+
+# === ШАГ 3: LASSO (Embedded) ===
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train_mi)
+X_test_scaled = scaler.transform(X_test_mi)
+
+lasso = LogisticRegression(penalty='l1', solver='liblinear', 
+                           C=0.1, random_state=42, max_iter=1000)
+lasso.fit(X_train_scaled, y_train)
+
+lasso_mask = np.abs(lasso.coef_[0]) > 0
+selected_lasso = X_train_mi.columns[lasso_mask]
+print(f"\nLasso оставил: {len(selected_lasso)} признаков")
+print(f"Это: {list(selected_lasso)}")
+
+X_train_lasso = X_train_mi[selected_lasso]
+X_test_lasso = X_test_mi[selected_lasso]
+
+# === ШАГ 4: RFE (Wrapper) ===
+model = LogisticRegression(max_iter=1000, random_state=42)
+rfe = RFE(estimator=model, n_features_to_select=5, step=1)
+rfe.fit(X_train_lasso, y_train)
+
+final_features = X_train_lasso.columns[rfe.support_]
+print(f"\nФинальные признаки RFE: {list(final_features)}")
+
+# === ПРОВЕРКА КАЧЕСТВА ===
+for name, X_tr, X_te in [("Все признаки", X_train, X_test),
+                          ("После MI", X_train_mi, X_test_mi),
+                          ("После Lasso", X_train_lasso, X_test_lasso),
+                          ("Финальные (RFE)", X_train_lasso[final_features], X_test_lasso[final_features])]:
+    
+    model_check = LogisticRegression(max_iter=1000, random_state=42)
+    model_check.fit(X_tr, y_train)
+    auc = roc_auc_score(y_test, model_check.predict_proba(X_te)[:, 1])
+    print(f"{name:20s} | Признаков: {X_tr.shape[1]:2d} | ROC-AUC: {auc:.3f}")
+
+# === ШАГ 5: PERMUTATION IMPORTANCE (проверка) ===
+rf_final = RandomForestClassifier(n_estimators=100, random_state=42)
+rf_final.fit(X_train_lasso[final_features], y_train)
+
+perm = permutation_importance(rf_final, X_test_lasso[final_features], y_test, 
+                              n_repeats=10, random_state=42)
+print(f"\nPermutation Importance финальных признаков:")
+for feat, imp in zip(final_features, perm.importances_mean):
+    print(f"  {feat}: {imp:.3f}")
+```
+
+---
+
+### 12.8. Чек-лист для самопроверки
+
+Перед переходом к Модулю 13 убедитесь, что вы:
+
+- [ ] Понимаете, что такое проклятие размерности и почему много признаков ≠ хорошо
+- [ ] Знаете разницу между Filter, Wrapper и Embedded методами
+- [ ] Умеете применять `VarianceThreshold` для удаления константных признаков
+- [ ] Можете отобрать признаки через `SelectKBest` с `mutual_info_classif`
+- [ ] Знаете, что такое хи-квадрат и когда его применять
+- [ ] Понимаете принцип работы RFE и умеете задать `n_features_to_select`
+- [ ] Знаете, что делает `RFECV` и чем он лучше обычного RFE
+- [ ] Понимаете, как Lasso (L1) обнуляет коэффициенты неважных признаков
+- [ ] Умеете получать `feature_importances_` из Random Forest
+- [ ] Знаете об ограничении встроенной важности деревьев (cardinality bias)
+- [ ] Понимаете идею Permutation Importance и умеете её применять
+- [ ] Можете выстроить пайплайн: Filter → Embedded → Wrapper
+- [ ] Понимаете, что отбор нужно делать на train-выборке, чтобы избежать утечки
+
+---
+
+> **Переход к Модулю 13:** Теперь, когда вы умеете создавать и отбирать признаки, пора научиться делать весь процесс воспроизводимым. Следующий модуль посвящён пайплайнам и автоматизации: как соединить очистку, кодирование, масштабирование и модель в единую цепочку, которую можно сохранить и применить к новым данным.

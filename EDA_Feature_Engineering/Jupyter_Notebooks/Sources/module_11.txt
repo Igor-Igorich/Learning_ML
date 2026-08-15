@@ -1,0 +1,430 @@
+# 📘 Модуль 11. Работа с несбалансированными данными
+## Подробный конспект
+
+---
+
+### 11.1. Зачем отдельно изучать несбалансированность
+
+В реальных задачах классы редко бывают равными. Примеры:
+
+- **Детекция мошенничества:** 99.9% транзакций честные, 0.1% — мошеннические
+- **Диагностика болезней:** 95% пациентов здоровы, 5% — больны
+- **Отток клиентов:** 90% остаются, 10% уходят
+- **Предсказание поломки оборудования:** 99.5% работает нормально, 0.5% — авария
+
+Если скормить такие данные модели «как есть», она с высокой вероятностью научится всегда предсказывать **большинство** (majority class). Результат: 99% точности (accuracy) и полная бесполезность модели, потому что она ни разу не поймала мошенника.
+
+**Аналогия:** вы учите охранника узнавать воров. Но воров в обучающей выборке 1%. Охранник решает: «всех пропускать» — и в 99% случаев оказывается прав. Но задача-то была поймать вора!
+
+---
+
+### 11.2. Почему accuracy (доля правильных ответов) — плохая метрика
+
+```python
+import numpy as np
+from sklearn.metrics import accuracy_score
+
+# Реальность: 1000 транзакций, 10 мошеннических
+y_true = np.array([0]*990 + [1]*10)  # 0 — норма, 1 — фрод
+
+# Модель говорит: «все честные»
+y_pred_all_zeros = np.array([0]*1000)
+
+print(f"Accuracy: {accuracy_score(y_true, y_pred_all_zeros):.3f}")
+# Accuracy: 0.990 — отлично? Нет, модель бесполезна.
+```
+
+**Accuracy** показывает долю правильных ответов. При сильном дисбалансе он всегда близок к доле большинства и ничего не говорит о качестве распознавания меньшинства.
+
+---
+
+### 11.3. Правильные метрики для несбалансированных данных
+
+#### Матрица ошибок (Confusion Matrix)
+
+|  | Предсказано 0 (Негатив) | Предсказано 1 (Позитив) |
+|--|------------------------|------------------------|
+| **Реально 0** | True Negative (TN) | False Positive (FP) |
+| **Реально 1** | False Negative (FN) | True Positive (TP) |
+
+- **TP:** модель сказала «мошенник», и это правда мошенник
+- **TN:** модель сказала «норма», и это правда норма
+- **FP:** модель сказала «мошенник», а это обычный клиент (ложная тревога)
+- **FN:** модель сказала «норма», а это был мошенник (пропуск цели)
+
+#### Precision (Точность)
+
+Из всех, кого модель назвала положительным классом, сколько действительно таковыми являются.
+
+$$\text{Precision} = \frac{TP}{TP + FP}$$
+
+**Интерпретация:** если precision = 0.3, то из 10 «тревог» модели только 3 — реальные мошенники, 7 — обычные клиенты.
+
+#### Recall (Полнота / Sensitivity)
+
+Из всех реальных положительных случаев, сколько модель нашла.
+
+$$\text{Recall} = \frac{TP}{TP + FN}$$
+
+**Интерпретация:** если recall = 0.5, модель поймала половину мошенников, а вторую половину пропустила.
+
+#### F1-score
+
+Среднее гармоническое precision и recall. Балансирует между ними.
+
+$$F1 = 2 \times \frac{\text{Precision} \times \text{Recall}}{\text{Precision} + \text{Recall}}$$
+
+- F1 = 1 — идеально
+- F1 = 0 — полный провал
+- Если precision или recall близки к 0, F1 тоже падает
+
+```python
+from sklearn.metrics import precision_score, recall_score, f1_score, classification_report
+
+y_true = np.array([0, 0, 0, 0, 1, 1, 1, 1])
+y_pred = np.array([0, 0, 0, 1, 0, 1, 1, 1])
+
+print(f"Precision: {precision_score(y_true, y_pred):.2f}")  # TP/(TP+FP) = 3/4 = 0.75
+print(f"Recall:    {recall_score(y_true, y_pred):.2f}")     # TP/(TP+FN) = 3/4 = 0.75
+print(f"F1:        {f1_score(y_true, y_pred):.2f}")         # 0.75
+
+# Полный отчёт
+print(classification_report(y_true, y_pred, target_names=['Норма', 'Мошенник']))
+```
+
+#### ROC-AUC (Area Under the ROC Curve)
+
+Показывает, насколько хорошо модель **ранжирует** объекты: способна ли она отделять классы.
+
+- **ROC-кривая:** зависимость True Positive Rate (Recall) от False Positive Rate при разных порогах классификации
+- **AUC:** площадь под кривой
+  - 0.5 — модель не лучше случайного угадывания
+  - 1.0 — идеальное разделение
+
+```python
+from sklearn.metrics import roc_auc_score
+
+# Вероятности принадлежности классу 1
+y_proba = np.array([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.9])
+print(f"ROC-AUC: {roc_auc_score(y_true, y_proba):.3f}")
+```
+
+**Когда использовать:** когда важна способность модели отличать классы в целом, не привязываясь к конкретному порогу.
+
+#### PR-AUC (Precision-Recall AUC)
+
+При сильном дисбалансе ROC-AUC может быть обманчиво высоким. PR-AUC фокусируется на положительном классе и чувствителен к качеству предсказания меньшинства.
+
+```python
+from sklearn.metrics import average_precision_score
+
+print(f"PR-AUC: {average_precision_score(y_true, y_proba):.3f}")
+```
+
+**Правило:** при дисбалансе смотрите на **F1** и **PR-AUC**, а не на accuracy.
+
+---
+
+### 11.4. Методы сэмплирования (Resampling)
+
+Идея: изменить баланс классов в обучающей выборке, чтобы модель уделила больше внимания меньшинству.
+
+> **Важно:** сэмплирование применяется **только к обучающей выборке**. Тестовая выборка должна оставаться реалистичной, иначе вы оцените качество на «искусственных» данных.
+
+#### Стратегия 1: Random Undersampling (случайное уменьшение)
+
+Удаляем случайные примеры из большинства, пока классы не сравняются.
+
+```python
+from imblearn.under_sampling import RandomUnderSampler
+
+X = np.random.rand(1000, 5)
+y = np.array([0]*950 + [1]*50)  # 95% vs 5%
+
+print(f"До: {np.bincount(y)}")
+# [950  50]
+
+rus = RandomUnderSampler(random_state=42)
+X_res, y_res = rus.fit_resample(X, y)
+
+print(f"После: {np.bincount(y_res)}")
+# [50 50]
+```
+
+**Плюсы:** быстро, просто, уменьшает время обучения.
+**Минусы:** вы теряете много данных из большинства (в примере — 900 строк). Модель не увидит реальную картину.
+
+#### Стратегия 2: Random Oversampling (случайное увеличение)
+
+Дублируем случайные примеры меньшинства.
+
+```python
+from imblearn.over_sampling import RandomOverSampler
+
+ros = RandomOverSampler(random_state=42)
+X_res, y_res = ros.fit_resample(X, y)
+
+print(f"После: {np.bincount(y_res)}")
+# [950 950]
+```
+
+**Плюсы:** не теряете данные.
+**Минусы:** переобучение на дублированных примерах. Модель будет «зубрить» конкретные случаи мошенничества.
+
+---
+
+### 11.5. SMOTE (Synthetic Minority Over-sampling Technique)
+
+**Идея:** вместо простого копирования создаём **новые синтетические** примеры меньшинства.
+
+**Алгоритм (упрощённо):**
+1. Берём точку из меньшинства
+2. Находим её k ближайших соседей (тоже из меньшинства)
+3. Случайно выбираем одного соседа
+4. Создаём новую точку где-то на отрезке между ними
+
+```python
+from imblearn.over_sampling import SMOTE
+
+smote = SMOTE(random_state=42, k_neighbors=5)
+X_res, y_res = smote.fit_resample(X, y)
+
+print(f"После SMOTE: {np.bincount(y_res)}")
+# [950 950]
+```
+
+**Плюсы:** новые данные, а не копии; разнообразие; лучше, чем Random Oversampling.
+**Минусы:**
+- Может создавать «шумные» примеры на границе классов
+- Не работает с категориальными признаками (для этого есть SMOTENC)
+- Увеличивает время обучения
+
+#### SMOTENC — для смешанных данных (числа + категории)
+
+```python
+from imblearn.over_sampling import SMOTENC
+
+# Указываем индексы категориальных столбцов
+smote_nc = SMOTENC(categorical_features=[2, 3], random_state=42)
+X_res, y_res = smote_nc.fit_resample(X, y)
+```
+
+---
+
+### 11.6. ADASYN (Adaptive Synthetic Sampling)
+
+Продвинутая версия SMOTE. Создаёт больше синтетических примеров в тех областях, где меньшинство **тяжелее отделить** от большинства (плотное смешение классов).
+
+```python
+from imblearn.over_sampling import ADASYN
+
+adasyn = ADASYN(random_state=42)
+X_res, y_res = adasyn.fit_resample(X, y)
+```
+
+**Отличие от SMOTE:** SMOTE равномерно создаёт точки. ADASYN «прицеливается» в проблемные зоны.
+
+---
+
+### 11.7. Комбинированные методы: SMOTETomek
+
+**Идея:** сначала увеличиваем меньшинство через SMOTE, затем **очищаем границу** классов, удаляя пары Tomek Links.
+
+**Tomek Link:** две точки из разных классов, которые являются ближайшими соседями друг друга. Они часто — шум на границе.
+
+```python
+from imblearn.combine import SMOTETomek
+
+smote_tomek = SMOTETomek(random_state=42)
+X_res, y_res = smote_tomek.fit_resample(X, y)
+```
+
+**Плюсы:** лучшее качество на границах классов.
+**Минусы:** медленнее.
+
+---
+
+### 11.8. Взвешивание классов (Class Weight)
+
+Вместо изменения данных можно сказать модели: «ошибка на меньшинстве важнее».
+
+**Как работает:** в функцию потерь добавляется множитель. Ошибка на редком классе штрафуется сильнее.
+
+```python
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+
+# Вариант 1: 'balanced' — автоматический расчёт весов
+# Вес обратно пропорционален частоте класса
+model = LogisticRegression(class_weight='balanced', random_state=42)
+
+# Вариант 2: ручное задание весов
+# Например, ошибка на мошеннике в 50 раз важнее
+model = RandomForestClassifier(
+    class_weight={0: 1, 1: 50},  # класс 0 (норма) вес 1, класс 1 (фрод) вес 50
+    random_state=42
+)
+```
+
+**Формула веса для `balanced`:**
+$$w_j = \frac{n_{\text{samples}}}{n_{\text{classes}} \times n_{\text{samples}_j}}$$
+
+**Когда использовать:** быстро, не меняет данные, работает «из коробки» в sklearn.
+**Минусы:** не всегда достаточно эффективно при экстремальном дисбалансе (1:1000).
+
+---
+
+### 11.9. Пороговая оптимизация (Threshold Tuning)
+
+Модели классификации обычно возвращают **вероятность** принадлежности к классу 1. По умолчанию порог = 0.5: если вероятность > 0.5, предсказываем 1.
+
+При дисбалансе порог 0.5 может быть неоптимальным. Если модель чуть-чуть «подозревает» мошенничество (вероятность 0.3), возможно, стоит проверить.
+
+```python
+from sklearn.metrics import precision_recall_curve, f1_score
+import matplotlib.pyplot as plt
+
+# Обучим модель и получим вероятности
+model = LogisticRegression(class_weight='balanced', random_state=42)
+model.fit(X_train, y_train)
+y_proba = model.predict_proba(X_test)[:, 1]
+
+# Перебираем пороги
+thresholds = np.arange(0.1, 0.9, 0.05)
+f1_scores = []
+
+for t in thresholds:
+    y_pred_t = (y_proba >= t).astype(int)
+    f1_scores.append(f1_score(y_test, y_pred_t))
+
+best_threshold = thresholds[np.argmax(f1_scores)]
+print(f"Лучший порог по F1: {best_threshold:.2f}, F1: {max(f1_scores):.3f}")
+
+# Или через precision-recall curve
+precision, recall, thresh = precision_recall_curve(y_test, y_proba)
+f1_curve = 2 * (precision * recall) / (precision + recall + 1e-9)
+
+plt.plot(thresh, f1_curve[:-1])
+plt.axvline(best_threshold, color='red', linestyle='--')
+plt.xlabel('Порог')
+plt.ylabel('F1-score')
+plt.title('Оптимизация порога')
+plt.show()
+```
+
+**Выбор порога зависит от бизнес-задачи:**
+- **Важен recall** (не пропустить мошенника): порог ниже (0.1–0.3), больше FP
+- **Важен precision** (не тревожить лишний раз): порог выше (0.7–0.9), больше FN
+- **Баланс:** максимизируем F1
+
+---
+
+### 11.10. Практический пример: полный цикл
+
+```python
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (classification_report, roc_auc_score, 
+                             average_precision_score, confusion_matrix)
+from imblearn.over_sampling import SMOTE
+from imblearn.under_sampling import RandomUnderSampler
+from collections import Counter
+
+np.random.seed(42)
+
+# Создаём сильно несбалансированные данные
+n = 10000
+X = np.random.randn(n, 5)
+# Менее 1% положительных примеров
+y = np.random.binomial(1, p=0.008, size=n)
+
+print(f"Распределение классов: {Counter(y)}")
+# Counter({0: 9920, 1: 80})
+
+# Разделение (ВАЖНО: до сэмплирования!)
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=y
+)
+
+print(f"Train: {Counter(y_train)}")
+print(f"Test:  {Counter(y_test)}")
+
+# === БАЗОВАЯ МОДЕЛЬ (без балансировки) ===
+model_base = LogisticRegression(random_state=42, max_iter=1000)
+model_base.fit(X_train, y_train)
+y_pred_base = model_base.predict(X_test)
+
+print("\n=== БАЗОВАЯ МОДЕЛЬ ===")
+print(f"Accuracy: {(y_pred_base == y_test).mean():.3f}")
+print(classification_report(y_test, y_pred_base, target_names=['Норма', 'Мошенник']))
+
+# === С ВЗВЕШИВАНИЕМ ===
+model_weighted = LogisticRegression(class_weight='balanced', random_state=42, max_iter=1000)
+model_weighted.fit(X_train, y_train)
+y_pred_w = model_weighted.predict(X_test)
+
+print("\n=== С ВЗВЕШИВАНИЕМ ===")
+print(classification_report(y_test, y_pred_w, target_names=['Норма', 'Мошенник']))
+
+# === СО SMOTE ===
+smote = SMOTE(random_state=42, k_neighbors=3)
+X_train_sm, y_train_sm = smote.fit_resample(X_train, y_train)
+print(f"\nTrain после SMOTE: {Counter(y_train_sm)}")
+
+model_smote = LogisticRegression(random_state=42, max_iter=1000)
+model_smote.fit(X_train_sm, y_train_sm)
+y_pred_sm = model_smote.predict(X_test)
+
+print("\n=== SMOTE ===")
+print(classification_report(y_test, y_pred_sm, target_names=['Норма', 'Мошенник']))
+
+# === СМЕШАННАЯ СТРАТЕГИЯ: Undersampling + SMOTE ===
+# Иногда полезно немного уменьшить большинство, а потом увеличить меньшинство
+rus = RandomUnderSampler(sampling_strategy=0.1, random_state=42)  # 10:1
+X_train_rus, y_train_rus = rus.fit_resample(X_train, y_train)
+
+smote_after = SMOTE(random_state=42)
+X_train_combo, y_train_combo = smote_after.fit_resample(X_train_rus, y_train_rus)
+
+print(f"\nКомбинированная: {Counter(y_train_combo)}")
+
+model_combo = LogisticRegression(random_state=42, max_iter=1000)
+model_combo.fit(X_train_combo, y_train_combo)
+y_pred_combo = model_combo.predict(X_test)
+
+print("\n=== UNDERSAMPLING + SMOTE ===")
+print(classification_report(y_test, y_pred_combo, target_names=['Норма', 'Мошенник']))
+
+# === СРАВНЕНИЕ ROC-AUC ===
+for name, model in [("Base", model_base), ("Weighted", model_weighted), 
+                    ("SMOTE", model_smote), ("Combo", model_combo)]:
+    proba = model.predict_proba(X_test)[:, 1]
+    print(f"{name:12s} ROC-AUC: {roc_auc_score(y_test, proba):.3f} | "
+          f"PR-AUC: {average_precision_score(y_test, proba):.3f}")
+```
+
+---
+
+### 11.11. Чек-лист для самопроверки
+
+Перед переходом к Модулю 12 убедитесь, что вы:
+
+- [ ] Понимаете, почему accuracy обманывает при дисбалансе классов
+- [ ] Можете объяснить разницу между precision и recall простыми словами
+- [ ] Знаете формулу F1-score и понимаете, зачем она нужна
+- [ ] Можете рассчитать ROC-AUC и знаете, что означает 0.5 и 1.0
+- [ ] Понимаете, почему при сильном дисбалансе полезен PR-AUC
+- [ ] Знаете, что такое Random Undersampling и его главный минус (потеря данных)
+- [ ] Понимаете, почему Random Oversampling может привести к переобучению
+- [ ] Знаете принцип работы SMOTE (синтетические примеры между соседями)
+- [ ] Понимаете разницу между SMOTE и ADASYN
+- [ ] Знаете, что делает SMOTETomek (очистка границ)
+- [ ] Умеете задавать `class_weight='balanced'` и ручные веса
+- [ ] Понимаете идею пороговой оптимизации и можете подобрать порог по F1
+- [ ] Знаете золотое правило: сэмплирование только на train, тест остаётся реальным
+
+---
+
+> **Переход к Модулю 12:** Теперь, когда вы умеете справляться с дисбалансом, пора научиться отбирать только самые полезные признаки. Мы изучим методы Feature Selection: фильтрационные, wrapper и embedded подходы, а также разберёмся, как бороться с проклятием размерности.
