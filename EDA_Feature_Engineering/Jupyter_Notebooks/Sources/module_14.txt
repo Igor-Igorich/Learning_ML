@@ -1,0 +1,506 @@
+ # 📘 Модуль 14. Практические проекты
+## Подробный конспект
+
+---
+
+### 14.0. Как работать с проектами
+
+Этот модуль — не теория, а **практика**. Каждый проект — это полный цикл от сырых данных до обученной модели. Рекомендуемый порядок:
+
+1. Загрузите данные и сделайте первичный осмотр (Модуль 1).
+2. Проведите EDA: статистику, визуализацию, корреляции (Модули 2–4).
+3. Очистите данные (Модуль 5).
+4. Обработайте выбросы (Модуль 6).
+5. Трансформируйте распределения (Модуль 7).
+6. Закодируйте категории и масштабируйте числа (Модули 8–9).
+7. Создайте новые признаки (Модуль 10).
+8. Если классы несбалансированы — сбалансируйте (Модуль 11).
+9. Отберите признаки (Модуль 12).
+10. Соберите всё в `Pipeline`, обучите, оцените, сохраните (Модуль 13).
+
+> **Правило:** не переходите к следующему шагу, пока не зафиксируете текущий в виде воспроизводимого кода.
+
+---
+
+## Проект 1. «Титаник» (классика EDA)
+
+**Цель:** предсказать, выжил ли пассажир (`Survived`: 0 или 1). Классическая задача бинарной классификации.
+
+### Данные (основные столбцы)
+| Столбец | Тип | Описание |
+|---------|-----|----------|
+| `Survived` | Целевой | 1 = выжил, 0 = нет |
+| `Pclass` | Порядковый | Класс билета: 1, 2, 3 |
+| `Name` | Текст | Имя и титул |
+| `Sex` | Номинальный | male / female |
+| `Age` | Числовой | Возраст (много пропусков) |
+| `SibSp` | Числовой | Братья/сёстры + супруги на борту |
+| `Parch` | Числовой | Родители + дети на борту |
+| `Ticket` | Текст | Номер билета |
+| `Fare` | Числовой | Стоимость билета |
+| `Cabin` | Текст | Номер каюты (много пропусков) |
+| `Embarked` | Номинальный | Порт посадки: C, Q, S |
+
+### Пошаговый план
+
+#### Шаг 1. Первичный осмотр
+```python
+import pandas as pd
+import numpy as np
+
+train = pd.read_csv('train.csv')
+test = pd.read_csv('test.csv')
+
+print(train.shape, test.shape)
+print(train.isnull().sum())
+# Age: ~20% пропусков
+# Cabin: ~77% пропусков
+# Embarked: 2 пропуска
+```
+
+#### Шаг 2. Очистка и FE
+```python
+# Объединяем для совместной обработки (только признаки, без таргета)
+combined = pd.concat([train.drop('Survived', axis=1), test], axis=0)
+
+# 1. Титул из имени (Mr, Mrs, Miss, Master, Rare)
+combined['Title'] = combined['Name'].str.extract(r' ([A-Za-z]+)\.', expand=False)
+combined['Title'] = combined['Title'].replace(['Lady', 'Countess', 'Capt', 'Col', 
+    'Don', 'Dr', 'Major', 'Rev', 'Sir', 'Jonkheer', 'Dona'], 'Rare')
+combined['Title'] = combined['Title'].replace(['Mlle', 'Ms'], 'Miss')
+combined['Title'] = combined['Title'].replace('Mme', 'Mrs')
+
+# 2. Заполнение Age медианой по титулу (Модуль 5 + доменные знания)
+combined['Age'] = combined.groupby('Title')['Age'].transform(
+    lambda x: x.fillna(x.median())
+)
+
+# 3. Семейный размер + флаг "одиночка" (Модуль 10)
+combined['FamilySize'] = combined['SibSp'] + combined['Parch'] + 1
+combined['IsAlone'] = (combined['FamilySize'] == 1).astype(int)
+
+# 4. Fare: заполняем медианой по Pclass
+combined['Fare'] = combined.groupby('Pclass')['Fare'].transform(
+    lambda x: x.fillna(x.median())
+)
+
+# 5. Embarked: мода
+combined['Embarked'] = combined['Embarked'].fillna(combined['Embarked'].mode()[0])
+
+# 6. Cabin → HasCabin (0/1), т.к. 77% пропусков (Модуль 10: индикатор)
+combined['HasCabin'] = combined['Cabin'].notna().astype(int)
+
+# 7. Извлечение палубы из Cabin (для тех, у кого есть)
+combined['Deck'] = combined['Cabin'].str[0]
+combined['Deck'] = combined['Deck'].fillna('Unknown')
+
+# 8. Категоризация Fare (биннинг, Модуль 7)
+combined['FareBin'] = pd.qcut(combined['Fare'], 4, labels=['Low', 'Med', 'High', 'Top'])
+
+# 9. Категоризация Age
+combined['AgeBin'] = pd.cut(combined['Age'], bins=[0, 12, 20, 40, 60, 100],
+                            labels=['Child', 'Teen', 'Adult', 'Middle', 'Senior'])
+
+# 10. Ticket: частота (сколько людей на один билет)
+ticket_counts = combined['Ticket'].value_counts()
+combined['TicketGroupSize'] = combined['Ticket'].map(ticket_counts)
+```
+
+#### Шаг 3. Кодирование и пайплайн
+```python
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, OrdinalEncoder, StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.ensemble import RandomForestClassifier
+
+# Разделяем обратно
+X = combined[:len(train)]
+y = train['Survived']
+X_test_final = combined[len(train):]
+
+# Группы
+numeric = ['Age', 'Fare', 'FamilySize', 'TicketGroupSize']
+ordinal = ['Pclass']  # можно оставить как число, т.к. порядок есть
+ohe = ['Sex', 'Embarked', 'Title', 'Deck', 'AgeBin', 'FareBin']
+passthrough = ['IsAlone', 'HasCabin', 'SibSp', 'Parch']
+
+preprocessor = ColumnTransformer([
+    ('num', Pipeline([('imputer', SimpleImputer(strategy='median')),
+                      ('scaler', StandardScaler())]), numeric),
+    ('ord', OrdinalEncoder(), ordinal),
+    ('cat', OneHotEncoder(handle_unknown='ignore', drop='first', sparse_output=False), ohe)
+], remainder='passthrough')
+
+model = Pipeline([
+    ('prep', preprocessor),
+    ('clf', RandomForestClassifier(n_estimators=200, random_state=42))
+])
+
+from sklearn.model_selection import cross_val_score
+print(cross_val_score(model, X, y, cv=5, scoring='accuracy').mean())
+```
+
+**Что отрабатывается:** пропуски (Age, Fare, Embarked), извлечение из текста (Title), биннинг (Fare, Age), OHE, порядковый признак (Pclass), индикаторы (HasCabin, IsAlone), агрегация (FamilySize, TicketGroupSize).
+
+---
+
+## Проект 2. Предсказание цен на недвижимость
+
+**Цель:** предсказать цену дома (регрессия). Работа с числовыми и категориальными признаками, геопризнаки, логарифмирование таргета.
+
+### Данные (типичный набор)
+| Столбец | Тип | Описание |
+|---------|-----|----------|
+| `SalePrice` / `Price` | Целевой | Цена |
+| `GrLivArea` | Числовой | Жилая площадь (кв. футы) |
+| `TotalBsmtSF` | Числовой | Площадь подвала |
+| `OverallQual` | Порядковый | Общее качество (1–10) |
+| `YearBuilt` | Числовой | Год постройки |
+| `Neighborhood` | Номинальный | Район |
+| `HouseStyle` | Номинальный | Стиль дома |
+| `GarageCars` | Числовой | Вместимость гаража |
+| `MSZoning` | Номинальный | Зонирование |
+
+### Пошаговый план
+
+#### Шаг 1. EDA и трансформация таргета
+```python
+import numpy as np
+import seaborn as sns
+
+# Цена всегда скошена вправо → логарифм (Модуль 7)
+df['SalePriceLog'] = np.log1p(df['SalePrice'])
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+sns.histplot(df['SalePrice'], kde=True, ax=axes[0])
+sns.histplot(df['SalePriceLog'], kde=True, ax=axes[1])
+```
+
+#### Шаг 2. FE и очистка
+```python
+# 1. Возраст дома и ремонта (Модуль 10: временные признаки)
+current_year = df['YrSold'].max()
+df['HouseAge'] = current_year - df['YearBuilt']
+df['YearsSinceRemodel'] = current_year - df['YearRemodAdd']
+
+# 2. Общая площадь
+df['TotalSF'] = df['TotalBsmtSF'] + df['1stFlrSF'] + df['2ndFlrSF']
+
+# 3. Цена за кв. фут (для анализа, не в модель — это target leakage!)
+# Вместо этого: площадь на комнату
+df['SqFtPerRoom'] = df['GrLivArea'] / (df['TotRmsAbvGrd'] + 1)
+
+# 4. Гараж: есть/нет
+df['HasGarage'] = (df['GarageArea'] > 0).astype(int)
+
+# 5. Подвал: есть/нет, качество подвала
+df['HasBasement'] = (df['TotalBsmtSF'] > 0).astype(int)
+
+# 6. Заполнение пропусков (Модуль 5)
+# GarageYrBlt: если нет гаража, можно заполнить YearBuilt или 0
+df['GarageYrBlt'] = df['GarageYrBlt'].fillna(df['YearBuilt'])
+
+# 7. Обработка выбросов (Модуль 6)
+# Дома с огромной площадью и низкой ценой — ошибки?
+q_low = df['GrLivArea'].quantile(0.01)
+q_high = df['GrLivArea'].quantile(0.99)
+df = df[(df['GrLivArea'] >= q_low) & (df['GrLivArea'] <= q_high)]
+```
+
+#### Шаг 3. Пайплайн с логарифмом таргета
+```python
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.metrics import mean_squared_error
+
+X = df.drop(['SalePrice', 'SalePriceLog'], axis=1)
+y = df['SalePriceLog']
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# Разделение типов
+num_features = ['GrLivArea', 'TotalSF', 'HouseAge', 'YearsSinceRemodel', 
+                'GarageCars', 'SqFtPerRoom']
+cat_features = ['Neighborhood', 'HouseStyle', 'MSZoning', 'OverallQual']
+
+preprocessor = ColumnTransformer([
+    ('num', Pipeline([('imputer', SimpleImputer(strategy='median')),
+                      ('scaler', StandardScaler())]), num_features),
+    ('cat', Pipeline([('imputer', SimpleImputer(strategy='most_frequent')),
+                      ('onehot', OneHotEncoder(handle_unknown='ignore'))]), cat_features)
+])
+
+model = Pipeline([
+    ('prep', preprocessor),
+    ('reg', GradientBoostingRegressor(random_state=42))
+])
+
+model.fit(X_train, y_train)
+
+# Предсказание → обратно из логарифма
+y_pred_log = model.predict(X_test)
+y_pred = np.expm1(y_pred_log)  # exp(x) - 1
+y_true = np.expm1(y_test)
+
+rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+print(f"RMSE: {rmse:,.0f}")
+```
+
+**Что отрабатывается:** логарифм таргета, временные признаки (возраст), агрегация (TotalSF), отношения (площадь на комнату), выбросы, OHE, обратная трансформация предсказаний.
+
+---
+
+## Проект 3. Анализ оттока клиентов (Churn)
+
+**Цель:** предсказать, уйдёт ли клиент (`Churn`: Yes/No). Ключевые темы: **несбалансированные данные**, **агрегационные признаки**, **Feature Selection**.
+
+### Данные (типичный Telecom Churn)
+| Столбец | Тип | Описание |
+|---------|-----|----------|
+| `Churn` | Целевой | Yes / No |
+| `tenure` | Числовой | Сколько месяцев клиент |
+| `MonthlyCharges` | Числовой | Ежемесячный платёж |
+| `TotalCharges` | Числовой | Общий платёж (может быть " ") |
+| `Contract` | Номинальный | Month-to-month / One year / Two year |
+| `PaymentMethod` | Номинальный | Electronic check, Mailed check и т.д. |
+| `InternetService` | Номинальный | DSL, Fiber optic, No |
+| `MultipleLines` | Номинальный | Yes / No / No phone service |
+| `OnlineSecurity` | Номинальный | Yes / No / No internet service |
+
+### Пошаговый план
+
+#### Шаг 1. EDA и дисбаланс
+```python
+df['Churn'] = df['Churn'].map({'Yes': 1, 'No': 0})
+
+print(df['Churn'].value_counts(normalize=True))
+# Обычно 70–80% остаются (0), 20–30% уходят (1) — дисбаланс
+```
+
+#### Шаг 2. Очистка и FE
+```python
+# 1. TotalCharges: может быть пробелом " " → NaN
+df['TotalCharges'] = pd.to_numeric(df['TotalCharges'], errors='coerce')
+
+# 2. Заполнение TotalCharges: tenure * MonthlyCharges (логично!)
+df['TotalCharges'] = df['TotalCharges'].fillna(df['tenure'] * df['MonthlyCharges'])
+
+# 3. Группы tenure (биннинг, Модуль 7 + 10)
+df['TenureGroup'] = pd.cut(df['tenure'], 
+                           bins=[0, 12, 24, 48, 100],
+                           labels=['New', 'Mid', 'Loyal', 'Veteran'])
+
+# 4. Средний месячный платёж (если бы он был фиксированным)
+df['AvgMonthly'] = df['TotalCharges'] / (df['tenure'] + 1)
+
+# 5. Отклонение текущего платежа от среднего (изменение цены?)
+df['ChargeDelta'] = df['MonthlyCharges'] - df['AvgMonthly']
+
+# 6. Количество подключённых сервисов (Модуль 10: агрегация)
+services = ['OnlineSecurity', 'OnlineBackup', 'DeviceProtection', 
+            'TechSupport', 'StreamingTV', 'StreamingMovies']
+
+# Преобразуем Yes/No в 1/0
+for col in services:
+    df[col] = df[col].map({'Yes': 1, 'No': 0, 'No internet service': 0})
+
+df['ServiceCount'] = df[services].sum(axis=1)
+
+# 7. Рискованные признаки
+df['IsMonthToMonth'] = (df['Contract'] == 'Month-to-month').astype(int)
+df['IsElectronicCheck'] = (df['PaymentMethod'] == 'Electronic check').astype(int)
+df['HasInternet'] = (df['InternetService'] != 'No').astype(int)
+```
+
+#### Шаг 3. Пайплайн с балансировкой
+```python
+from imblearn.over_sampling import SMOTE
+from imblearn.pipeline import Pipeline as ImbPipeline  # важно: Pipeline из imblearn!
+
+# Разделение
+X = df.drop(['Churn', 'customerID'], axis=1)
+y = df['Churn']
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, 
+                                                    random_state=42, stratify=y)
+
+num_features = ['tenure', 'MonthlyCharges', 'TotalCharges', 'AvgMonthly', 
+                'ChargeDelta', 'ServiceCount']
+cat_features = ['Contract', 'PaymentMethod', 'InternetService', 'TenureGroup']
+
+preprocessor = ColumnTransformer([
+    ('num', Pipeline([('imputer', SimpleImputer(strategy='median')),
+                      ('scaler', StandardScaler())]), num_features),
+    ('cat', OneHotEncoder(handle_unknown='ignore', drop='first'), cat_features)
+])
+
+# ImbPipeline позволяет вставить SMOTE между препроцессингом и моделью
+# НО: SMOTE лучше делать ПОСЛЕ кодирования, т.к. он работает с числами
+# Поэтому: preprocessor → SMOTE → classifier
+
+model = ImbPipeline([
+    ('prep', preprocessor),
+    ('smote', SMOTE(random_state=42)),
+    ('clf', RandomForestClassifier(class_weight='balanced', random_state=42))
+])
+
+model.fit(X_train, y_train)
+
+from sklearn.metrics import classification_report, roc_auc_score
+y_pred = model.predict(X_test)
+y_proba = model.predict_proba(X_test)[:, 1]
+
+print(classification_report(y_test, y_pred))
+print(f"ROC-AUC: {roc_auc_score(y_test, y_proba):.3f}")
+```
+
+**Что отрабатывается:** дисбаланс классов, SMOTE в пайплайне, заполнение пропусков через доменную логику, биннинг tenure, агрегация сервисов, бинарные индикаторы риска, OHE, метрики для несбалансированных данных.
+
+---
+
+## Проект 4. Временной ряд (продажи / трафик)
+
+**Цель:** предсказать продажи/трафик на следующий день/неделю. Работа с лагами, скользящими средними, датой.
+
+### Данные
+| Столбец | Тип | Описание |
+|---------|-----|----------|
+| `date` | Дата | Дата |
+| `sales` | Числовой | Целевой: объём продаж |
+| `traffic` | Числовой | Дополнительный признак |
+| `promo` | Бинарный | Было ли промо |
+
+### Пошаговый план
+
+#### Шаг 1. EDA временного ряда
+```python
+df['date'] = pd.to_datetime(df['date'])
+df = df.sort_values('date').set_index('date')
+
+# Визуализация тренда и сезонности (Модуль 3)
+df['sales'].plot(figsize=(14, 4), title='Продажи по времени')
+plt.show()
+
+# Проверка пропусков
+print(df.isnull().sum())
+```
+
+#### Шаг 2. FE: лаги и оконные функции
+```python
+# Лаги (значения в прошлом) — НЕТ утечки будущего! (Модуль 10)
+df['sales_lag_1'] = df['sales'].shift(1)   # вчера
+df['sales_lag_7'] = df['sales'].shift(7)   # неделю назад
+df['sales_lag_30'] = df['sales'].shift(30) # месяц назад
+
+# Скользящие средние (только прошлое!)
+df['sales_roll_mean_7'] = df['sales'].shift(1).rolling(window=7).mean()
+df['sales_roll_std_7'] = df['sales'].shift(1).rolling(window=7).std()
+
+# Нарастающее среднее (expanding)
+df['sales_expanding_mean'] = df['sales'].shift(1).expanding().mean()
+
+# Разница с предыдущим днём
+df['sales_diff_1'] = df['sales'].shift(1).diff(1)
+
+# Дата (Модуль 10)
+df['year'] = df.index.year
+df['month'] = df.index.month
+df['day'] = df.index.day
+df['dayofweek'] = df.index.dayofweek
+df['is_weekend'] = (df['dayofweek'] >= 5).astype(int)
+df['is_month_start'] = (df['day'] <= 5).astype(int)
+df['is_month_end'] = (df['day'] >= 25).astype(int)
+
+# Циклические признаки (Модуль 10)
+df['month_sin'] = np.sin(2 * np.pi * df['month'] / 12)
+df['month_cos'] = np.cos(2 * np.pi * df['month'] / 12)
+df['dow_sin'] = np.sin(2 * np.pi * df['dayofweek'] / 7)
+df['dow_cos'] = np.cos(2 * np.pi * df['dayofweek'] / 7)
+
+# Время с начала наблюдений
+df['days_since_start'] = (df.index - df.index.min()).days
+
+# Удаляем строки с NaN (появились из-за shift)
+df = df.dropna()
+```
+
+#### Шаг 3. Разделение без перемешивания!
+```python
+# Временные ряды НЕЛЬЗЯ перемешивать!
+# Берём первые 80% для обучения, последние 20% для теста
+split_idx = int(len(df) * 0.8)
+
+train = df.iloc[:split_idx]
+test = df.iloc[split_idx:]
+
+X_train = train.drop('sales', axis=1)
+y_train = train['sales']
+X_test = test.drop('sales', axis=1)
+y_test = test['sales']
+```
+
+#### Шаг 4. Модель
+```python
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.metrics import mean_absolute_percentage_error
+
+model = GradientBoostingRegressor(n_estimators=200, random_state=42)
+model.fit(X_train, y_train)
+
+y_pred = model.predict(X_test)
+
+# MAPE: средняя абсолютная процентная ошибка
+mape = mean_absolute_percentage_error(y_test, y_pred)
+print(f"MAPE: {mape:.2%}")
+
+# Визуализация предсказаний
+plt.figure(figsize=(14, 4))
+plt.plot(y_test.index, y_test, label='Факт')
+plt.plot(y_test.index, y_pred, label='Прогноз', alpha=0.8)
+plt.legend()
+plt.show()
+```
+
+**Что отрабатывается:** лаги, rolling/expanding, дата-компоненты, циклические признаки, **временное разделение** (без `train_test_split(shuffle=True)`!), оценка прогноза.
+
+---
+
+### 14.5. Общие рекомендации по выполнению проектов
+
+| Этап | Что проверить |
+|------|--------------|
+| **Загрузка** | `head()`, `info()`, `describe()`, пропуски, дубликаты |
+| **EDA** | Гистограммы, boxplot, корреляции, scatterplot для пар |
+| **Очистка** | Пропуски заполнены осмысленно, а не «по умолчанию» |
+| **Выбросы** | Проверены boxplot, принято решение: удалить / ограничить / оставить |
+| **Трансформации** | Логарифм, если скошено; биннинг, если нужны категории |
+| **FE** | Создано минимум 3–5 новых признаков с обоснованием |
+| **Кодирование** | Категории обработаны правильно (OHE / Ordinal / Target) |
+| **Масштабирование** | Применено, если модель требует; без утечки |
+| **Балансировка** | Если классификация — проверена, обработана |
+| **Отбор** | Удалены лишние / шумовые признаки |
+| **Пайплайн** | Всё собрано в `Pipeline` / `ColumnTransformer` |
+| **Оценка** | Правильные метрики, кросс-валидация, отложенный тест |
+| **Сохранение** | Модель и препроцессор сохранены через `joblib` |
+
+---
+
+### 14.6. Чек-лист завершения курса
+
+Пройдите этот список — если всё выполнено, вы готовы к реальным задачам ML:
+
+- [ ] Я самостоятельно выполнил все 4 проекта от начала до конца
+- [ ] В каждом проекте есть воспроизводимый `Pipeline`
+- [ ] Я не использовал `fit` на тестовых данных ни на одном шаге
+- [ ] Я создавал новые признаки на основе логики, а не случайно
+- [ ] Я проверял распределение таргета и признаков перед моделированием
+- [ ] Я использовал правильные метрики (не accuracy при дисбалансе)
+- [ ] Я сохранял лучшие модели и могу загрузить их для предсказания
+- [ ] Я могу объяснить выбор каждого метода кодирования и масштабирования
+- [ ] Я понимаю, когда применять SMOTE, а когда — class_weight
+- [ ] Я умею работать с датами: извлекать компоненты и строить лаги
+
+---
+
+> **Финал курса:** Вы прошли полный путь от загрузки CSV до продакшен-готового пайплайна. Дальнейшее развитие: изучение конкретных алгоритмов (XGBoost, нейросети), AutoML (AutoGluon, H2O), Feature Stores и автоматический FE (Featuretools). Удачи в реальных проектах!
