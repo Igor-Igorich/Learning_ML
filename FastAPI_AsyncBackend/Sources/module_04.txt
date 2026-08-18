@@ -1,0 +1,1005 @@
+# Модуль 4. FastAPI: архитектура, жизненный цикл и обработка запросов
+
+---
+
+## Введение в модуль
+
+После трёх модулей фундамента — Python, `asyncio`, сетевые протоколы — мы наконец подходим к фреймворку, ради которого создавался весь курс. Но FastAPI не будет казаться магией: мы знаем, что под ним лежит Starlette (ASGI), что ASGI стоит на event loop, а event loop — это кооперативная многозадачность над неблокирующими сокетами.
+
+В этом модуле мы разберём:
+- почему FastAPI построен именно так, и как его философия отличается от Django;
+- что такое ASGI на уровне вызовов функций;
+- как Pydantic V2 превращает аннотации типов в машину валидации со скоростью, близкой к компилируемым языкам;
+- как обрабатывать ошибки централизованно, не разбрасывая `try/except` по всем endpoint'ам;
+- почему `BaseHTTPMiddleware` может убить производительность асинхронного сервера, и как писать «чистые» ASGI-мидлвари;
+- как управлять жизненным циклом приложения, чтобы ML-модель загружалась один раз при старте и корректно освобождала память при остановке.
+
+---
+
+## 4.1. Философия фреймворка
+
+### 4.1.1. Starlette + Pydantic = FastAPI
+
+FastAPI — это не монолит. Это **композиция** двух специализированных инструментов:
+
+| Компонент | Отвечает за | Аналогия |
+|-----------|-------------|----------|
+| **Starlette** | ASGI-инфраструктуру: роутинг, middleware, lifespan, Request/Response объекты, WebSocket, фоновые задачи. | Двигатель и шасси автомобиля. |
+| **Pydantic** | Валидацию, сериализацию, генерацию схем. | Система безопасности и диагностики. |
+
+FastAPI добавляет к Starlette:
+- Автоматическую валидацию параметров через Pydantic.
+- Автоматическую генерацию OpenAPI-схемы и документации Swagger UI / ReDoc.
+- Dependency Injection систему (`Depends`).
+- Нативную интеграцию с `async`/`await` без «костылей».
+
+### 4.1.2. Type-driven development
+
+В традиционном Python типы — это подсказки. В FastAPI типы — это **исполняемые спецификации**.
+
+```python
+from fastapi import FastAPI
+from pydantic import BaseModel
+
+app = FastAPI()
+
+class User(BaseModel):
+    id: int
+    name: str
+    is_active: bool = True
+
+@app.post("/users/")
+async def create_user(user: User):
+    return user
+```
+
+Что происходит, когда клиент отправляет `POST /users/` с JSON `{"id": "42", "name": "Alice"}`?
+
+1. FastAPI видит аннотацию `user: User`.
+2. Передаёт тело запроса в Pydantic.
+3. Pydantic V2 (на Rust) парсит JSON, валидирует типы, приводит `"42"` к `int`, проверяет, что `name` не пустой.
+4. Если валидация прошла — в функцию передаётся экземпляр `User`.
+5. Если нет — автоматически возвращается `422 Unprocessable Entity` с детализацией ошибок.
+6. OpenAPI-схема генерируется из полей `User` автоматически.
+
+**Парадигма:** сначала типы, потом код. Функция не начинает выполняться, пока контракт не подтверждён.
+
+### 4.1.3. Сравнение с Django REST Framework и Flask
+
+| Аспект | Django REST Framework | Flask + Flask-RESTX | FastAPI |
+|--------|----------------------|---------------------|---------|
+| **Асинхронность** | Частичная (с Django 4+), ORM не полностью async | Нет (Werkzeug синхронен) | Нативная, на ASGI |
+| **Валидация** | Сериализаторы (классы с `validate_*`) | `reqparse` или marshmallow | Pydantic, встроено |
+| **Документация** | Автогенерация через `get_schema_view` | Swagger через аннотации | OpenAPI из коробки, без конфигурации |
+| **Производительность** | Средняя | Низкая (синхронный WSGI) | Высокая (асинхронный, Pydantic на Rust) |
+| **Философия** | «Батарейки в комплекте» (monolith) | Минимализм | Type-driven, декларативность |
+
+Django — фреймворк «всё включено»: ORM, админка, аутентификация, формы. Это мощно для классических веб-приложений, но избыточно для ML-микросервисов, где нужен только JSON API.
+
+Flask — минималистичный, но синхронный. Асинхронные расширения (` Quart`) — вторичны и фрагментированы.
+
+FastAPI занимает нишу: **максимум производительности при минимуме кода** для API-сервисов.
+
+---
+
+## 4.2. ASGI: от WSGI к асинхронности
+
+### 4.2.1. Почему WSGI мёртв для async
+
+WSGI (Web Server Gateway Interface) — стандарт Python для веб-приложений с 2003 года. Его интерфейс:
+
+```python
+def application(environ, start_response):
+    # environ: словарь с заголовками, методом, путём
+    # start_response: callable для установки статуса и заголовков
+    status = '200 OK'
+    headers = [('Content-Type', 'text/plain')]
+    start_response(status, headers)
+    return [b'Hello World']
+```
+
+Ключевая проблема: `application` — **синхронная функция**. Она должна вернуть итератор байтов немедленно. Она не может `await` чтения тела запроса или записи ответа.
+
+Если внутри WSGI-приложения нужно сделать запрос к базе данных — весь worker-процесс блокируется. Gunicorn с синхронными worker'ами создаёт процесс на каждый запрос (или держит пул процессов). Это работает, но не масштабируется на десятки тысяч соединений.
+
+### 4.2.2. ASGI-интерфейс: `scope`, `receive`, `send`
+
+ASGI (Asynchronous Server Gateway Interface) — стандарт, принятый в 2016 году. Он описывает приложение как **асинхронный callable**:
+
+```python
+async def application(scope, receive, send):
+    ...
+```
+
+| Параметр | Тип | Назначение |
+|----------|-----|------------|
+| `scope` | `dict` | Контекст соединения: тип (`http`/`websocket`), метод, путь, заголовки, query-string, информация о сервере и клиенте. Живёт всё время соединения. |
+| `receive` | `Callable[[], Awaitable[dict]]` | Асинхронная функция для получения событий от клиента (тело запроса, сообщения WebSocket). |
+| `send` | `Callable[[dict], Awaitable[None]]` | Асинхронная функция для отправки событий клиенту (старт ответа, тело, закрытие). |
+
+#### Пример «голого» ASGI-приложения
+
+```python
+async def app(scope, receive, send):
+    # scope содержит метаинформацию о запросе
+    assert scope['type'] == 'http'
+    
+    # Получаем тело запроса (если есть)
+    body = b''
+    while True:
+        message = await receive()
+        if message['type'] == 'http.request':
+            body += message.get('body', b'')
+            if not message.get('more_body', False):
+                break
+    
+    # Формируем ответ
+    await send({
+        'type': 'http.response.start',
+        'status': 200,
+        'headers': [(b'content-type', b'text/plain')],
+    })
+    
+    await send({
+        'type': 'http.response.body',
+        'body': b'Hello, ASGI!',
+    })
+```
+
+Это и есть минимальное ASGI-приложение. Оно не использует FastAPI, Starlette или любой другой фреймворк — только протокол ASGI.
+
+#### Структура `scope` для HTTP
+
+```python
+{
+    'type': 'http',
+    'asgi': {'version': '3.0', 'spec_version': '2.3'},
+    'http_version': '1.1',
+    'method': 'POST',
+    'scheme': 'https',
+    'path': '/users/',
+    'query_string': b'page=1&limit=10',
+    'root_path': '',
+    'headers': [
+        (b'host', b'api.example.com'),
+        (b'content-type', b'application/json'),
+        (b'content-length', b'47'),
+    ],
+    'client': ('192.168.1.1', 54321),
+    'server': ('127.0.0.1', 8000),
+}
+```
+
+### 4.2.3. Жизненный цикл запроса в ASGI
+
+```
+┌─────────────┐     ┌─────────────┐     ┌─────────────────┐
+│   Client    │────▶│  Uvicorn    │────▶│  ASGI App       │
+│  (Browser)  │     │  (Server)   │     │  (FastAPI)      │
+└─────────────┘     └─────────────┘     └─────────────────┘
+       │                    │                    │
+       │  1. TCP connect    │                    │
+       │───────────────────▶│                    │
+       │                    │  2. Create scope   │
+       │                    │───────────────────▶│
+       │  3. HTTP request   │                    │
+       │───────────────────▶│  4. receive()      │
+       │                    │───────────────────▶│
+       │                    │  5. Process logic  │
+       │                    │                    │
+       │                    │  6. send(start)    │
+       │                    │◀───────────────────│
+       │  7. HTTP response  │                    │
+       │◀───────────────────│  8. send(body)     │
+       │                    │◀───────────────────│
+       │                    │  9. Connection     │
+       │                    │     close / keep   │
+```
+
+Критически важно: `receive` и `send` — это **не просто функции**. Они — каналы связи между сервером (Uvicorn) и приложением (FastAPI). Uvicorn читает байты из сокета, парсит HTTP, упаковывает в события и передаёт через `receive`. FastAPI формирует ответ, передаёт через `send`, а Uvicron сериализует в HTTP и пишет в сокет.
+
+### 4.2.4. ASGI-серверы: Uvicorn, Hypercorn, Daphne
+
+| Сервер | Особенности | Когда использовать |
+|--------|-------------|-------------------|
+| **Uvicorn** | Быстрый, на `uvloop` (Cython-реализация event loop), поддерживает HTTP/1.1 и WebSocket. Стандарт для FastAPI. | Почти всегда. |
+| **Hypercorn** | Поддерживает HTTP/2, HTTP/3, WebSocket. Написан на чистом Python, медленнее Uvicorn. | Когда нужен HTTP/2 или HTTP/3. |
+| **Daphne** | Первый ASGI-сервер, разработан для Django Channels. | Legacy, Django Channels. |
+
+Uvicorn использует `uvloop` — реализацию event loop на Cython, которая в 2–4 раза быстрее стандартного `asyncio`. Он также использует `httptools` — парсер HTTP на C.
+
+```bash
+# Запуск
+uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4
+
+# main:app — объект FastAPI в файле main.py
+# --workers 4 — 4 процесса-воркера (multiprocessing)
+```
+
+### 4.2.5. Математическая подоплека: ASGI как система ввода-вывода с конечным автоматом
+
+С точки зрения теории автоматов, ASGI-приложение для HTTP-запроса — это автомат с состояниями:
+
+$$Q = \{ \text{INIT}, \text{RECEIVING}, \text{PROCESSING}, \text{SENDING}, \text{DONE} \}$$
+
+Переходы:
+- $\text{INIT} \xrightarrow{\text{scope создан}} \text{RECEIVING}$
+- $\text{RECEIVING} \xrightarrow{\text{receive() = http.request}} \text{RECEIVING}$ (если `more_body=True`)
+- $\text{RECEIVING} \xrightarrow{\text{receive() = http.request, more_body=False}} \text{PROCESSING}$
+- $\text{PROCESSING} \xrightarrow{\text{send() = response.start}} \text{SENDING}$
+- $\text{SENDING} \xrightarrow{\text{send() = response.body, more_body=False}} \text{DONE}$
+
+Uvicorn управляет множеством таких автоматов конкурентно, используя event loop.
+
+---
+
+## 4.3. Маршрутизация и обработчики
+
+### 4.3.1. APIRouter: модульность приложения
+
+Монолитный `main.py` с сотнями endpoint'ов не масштабируется. FastAPI использует `APIRouter` для разбиения на модули:
+
+```python
+# routers/users.py
+from fastapi import APIRouter
+
+router = APIRouter(
+    prefix="/users",
+    tags=["users"],
+    responses={404: {"description": "Not found"}},
+)
+
+@router.get("/")
+async def list_users():
+    return [{"id": 1, "name": "Alice"}]
+
+@router.get("/{user_id}")
+async def get_user(user_id: int):
+    return {"id": user_id, "name": "Alice"}
+```
+
+```python
+# main.py
+from fastapi import FastAPI
+from routers.users import router as users_router
+
+app = FastAPI()
+app.include_router(users_router)
+```
+
+`prefix="/users"` означает, что все пути в роутере автоматически получают префикс. `tags=["users"]` группирует endpoint'ы в документации Swagger UI.
+
+### 4.3.2. Path parameters: типизация и валидация
+
+```python
+@app.get("/items/{item_id}")
+async def read_item(item_id: int):
+    return {"item_id": item_id}
+```
+
+FastAPI извлекает `item_id` из пути, **парсит** его как `int` и передаёт в функцию. Если передать `/items/abc` — автоматический ответ `422 Unprocessable Entity` с детализацией.
+
+Можно использовать встроенные типы путей:
+
+```python
+@app.get("/files/{file_path:path}")
+async def read_file(file_path: str):
+    return {"file_path": file_path}
+```
+
+`:path` означает, что сегмент может содержать `/`. Без этого `/files/a/b.txt` не сматчится.
+
+### 4.3.3. Query parameters: валидация через `Query`
+
+```python
+from fastapi import Query
+
+@app.get("/items/")
+async def read_items(
+    q: str | None = Query(default=None, min_length=3, max_length=50),
+    skip: int = Query(default=0, ge=0),
+    limit: int = Query(default=10, ge=1, le=100),
+):
+    return {"q": q, "skip": skip, "limit": limit}
+```
+
+`Query(...)` — это не просто значение по умолчанию. Это **декларатор**, который сообщает FastAPI:
+- Этот параметр приходит из query-string (`?skip=0&limit=10`).
+- У него есть ограничения: `ge` (greater or equal), `le` (less or equal), `min_length`, `regex` и др.
+
+Если клиент отправит `?limit=200`, FastAPI вернёт `422` с сообщением: «limit must be less than or equal to 100».
+
+### 4.3.4. Request Body: Pydantic модели
+
+```python
+from pydantic import BaseModel, Field
+
+class Item(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    description: str | None = None
+    price: float = Field(gt=0, description="Price must be greater than zero")
+    tax: float | None = None
+
+@app.post("/items/")
+async def create_item(item: Item):
+    return item
+```
+
+**Вложенные модели:**
+
+```python
+class Image(BaseModel):
+    url: str
+    name: str
+
+class Item(BaseModel):
+    name: str
+    images: list[Image] = []
+```
+
+FastAPI автоматически ожидает JSON:
+
+```json
+{
+    "name": "Foo",
+    "images": [
+        {"url": "http://example.com/1.jpg", "name": "img1"}
+    ]
+}
+```
+
+### 4.3.5. Заголовки, куки, файлы, формы
+
+**Заголовки:**
+
+```python
+from fastapi import Header
+
+@app.get("/items/")
+async def read_items(user_agent: str | None = Header(default=None)):
+    return {"User-Agent": user_agent}
+```
+
+**Куки:**
+
+```python
+from fastapi import Cookie
+
+@app.get("/items/")
+async def read_items(session_id: str | None = Cookie(default=None)):
+    return {"session_id": session_id}
+```
+
+**Файлы:**
+
+```python
+from fastapi import File, UploadFile
+
+@app.post("/upload/")
+async def upload_file(file: UploadFile = File(...)):
+    content = await file.read()
+    return {"filename": file.filename, "size": len(content)}
+```
+
+`UploadFile` — это обёртка над SpooledTemporaryFile: маленькие файлы хранятся в памяти, большие — на диске. `await file.read()` — асинхронное чтение, не блокирующее event loop.
+
+**Формы:**
+
+```python
+from fastapi import Form
+
+@app.post("/login/")
+async def login(username: str = Form(...), password: str = Form(...)):
+    return {"username": username}
+```
+
+---
+
+## 4.4. Pydantic V2: модели данных и внутреннее устройство
+
+### 4.4.1. От V1 к V2: почему это революция
+
+Pydantic V1 (2019–2023) был написан на чистом Python. Валидация больших моделей была узким местом: десериализация JSON в Python-объекты с проверкой типов могла занимать миллисекунды на запрос. При тысячах RPS это становится критичным.
+
+Pydantic V2 (2023+) переписал ядро на **Rust** (`pydantic-core`). Rust даёт:
+- Отсутствие GIL (Global Interpreter Lock): валидация выполняется вне Python-интерпретатора.
+- Zero-copy парсинг: где возможно, данные не копируются, а ссылаются на исходный буфер.
+- Компиляцию в машинный код: нет накладных расходов интерпретации.
+
+**Сравнение производительности** (примерные цифры, зависят от железа):
+
+| Операция | Pydantic V1 | Pydantic V2 | Стандартный `json.loads` |
+|----------|-------------|-------------|-------------------------|
+| Валидация сложной модели | 1.0× (база) | 5–20× быстрее | Н/Д (нет валидации) |
+| Сериализация в JSON | 1.0× | 10–50× быстрее | 0.5× V2 (нет валидации) |
+
+### 4.4.2. Базовая модель
+
+```python
+from pydantic import BaseModel, Field, ConfigDict
+
+class User(BaseModel):
+    model_config = ConfigDict(strict=False)  # аналог class Config в V1
+    
+    id: int
+    name: str = Field(min_length=1)
+    email: str
+    age: int = Field(ge=0, le=150)
+```
+
+**Ключевые методы:**
+
+```python
+user = User(id="42", name="Alice", email="a@b.com", age=30)
+
+# Сериализация
+user.model_dump()           # dict
+user.model_dump_json()      # str (JSON)
+user.model_dump(mode="json") # dict с JSON-совместимыми типами (datetime → str)
+
+# Валидация из JSON
+json_str = '{"id": 42, "name": "Alice", "email": "a@b.com", "age": 30}'
+user = User.model_validate_json(json_str)
+
+# Валидация из dict
+data = {"id": 42, "name": "Alice", "email": "a@b.com", "age": 30}
+user = User.model_validate(data)
+```
+
+### 4.4.3. Валидаторы: `field_validator` и `model_validator`
+
+**Field validator** — проверка отдельного поля:
+
+```python
+from pydantic import BaseModel, field_validator
+
+class User(BaseModel):
+    email: str
+    
+    @field_validator('email')
+    @classmethod
+    def validate_email(cls, v: str) -> str:
+        if '@' not in v:
+            raise ValueError('Invalid email')
+        return v.lower()
+```
+
+**Model validator** — проверка всей модели:
+
+```python
+from pydantic import BaseModel, model_validator
+
+class Rectangle(BaseModel):
+    width: float
+    height: float
+    
+    @model_validator(mode='after')
+    def check_dimensions(self):
+        if self.width <= 0 or self.height <= 0:
+            raise ValueError('Dimensions must be positive')
+        return self
+```
+
+Режимы:
+- `mode='after'` — валидатор вызывается после базовой валидации полей (поля уже приведены к типам).
+- `mode='before'` — вызывается до валидации, получает сырые данные (dict).
+
+### 4.4.4. Внутреннее устройство `pydantic-core`
+
+`pydantic-core` — это Rust-библиотека, к которой Pydantic V2 обращается через Python C-API / PyO3.
+
+Архитектура:
+
+```
+┌─────────────────────────────────────────┐
+│           Python Layer                  │
+│  BaseModel, Field, ConfigDict,          │
+│  field_validator, model_validator       │
+├─────────────────────────────────────────┤
+│           Rust Core (pydantic-core)     │
+│  - JSON Parser (serde_json)             │
+│  - Schema Builder                       │
+│  - Validator Engine                     │
+│  - Type Coercion (int↔str, etc.)        │
+├─────────────────────────────────────────┤
+│           Python C-API / PyO3           │
+│  Передача данных между Python и Rust    │
+└─────────────────────────────────────────┘
+```
+
+**Zero-copy парсинг:**
+
+Когда `model_validate_json()` получает строку JSON, Rust-парсер `serde_json` десериализует её в Rust-структуры. Затем, если типы совпадают (например, JSON-строка → Python `str`, JSON-число → Python `int`), данные **переносятся** в Python-объекты без промежуточного копирования. Это возможно благодаря тому, что Rust и Python C-API работают с непрерывными блоками памяти.
+
+**Strict mode vs Lax mode:**
+
+```python
+class User(BaseModel):
+    model_config = ConfigDict(strict=True)
+    id: int
+
+# strict=True: "42" вызовет ошибку (str не int)
+# strict=False (по умолчанию): "42" автоматически преобразуется в 42
+```
+
+### 4.4.5. Математическая подоплека: JSON Schema как формальная грамматика
+
+JSON Schema — это язык описания структуры JSON-документов. Pydantic автоматически генерирует JSON Schema для каждой модели:
+
+```python
+print(User.model_json_schema())
+```
+
+Результат:
+
+```json
+{
+    "title": "User",
+    "type": "object",
+    "properties": {
+        "id": {"type": "integer"},
+        "name": {"type": "string", "minLength": 1},
+        "email": {"type": "string", "format": "email"},
+        "age": {"type": "integer", "minimum": 0, "maximum": 150}
+    },
+    "required": ["id", "name", "email", "age"]
+}
+```
+
+Формально, JSON Schema определяет **язык** $L$ — множество всех JSON-документов, удовлетворяющих схеме. Валидация Pydantic — это **распознавание принадлежности** входного документа $d$ языку $L$:
+
+$$\text{validate}(d) = \begin{cases} \text{OK}, & d \in L \\ \text{Error}, & d \notin L \end{cases}$$
+
+JSON Schema не является полным по Тьюрингу (это хорошо): проверка принадлежности всегда завершается за конечное время. Сложность валидации линейна относительно размера входа $O(n)$, что достигается за счёт однопроходного парсинга в Rust.
+
+---
+
+## 4.5. Ответы клиенту
+
+### 4.5.1. Типы Response
+
+FastAPI (через Starlette) предоставляет несколько классов ответов:
+
+```python
+from fastapi import Response, JSONResponse, HTMLResponse, StreamingResponse, FileResponse
+```
+
+| Класс | Назначение | Content-Type |
+|-------|-----------|--------------|
+| `Response` | Базовый, сырые байты | `text/plain` |
+| `JSONResponse` | Сериализация dict/list в JSON | `application/json` |
+| `HTMLResponse` | HTML-строка | `text/html` |
+| `PlainTextResponse` | Текст | `text/plain` |
+| `StreamingResponse` | Потоковая передача (генератор) | задаётся явно |
+| `FileResponse` | Отправка файла с диска | определяется по расширению |
+
+### 4.5.2. Возврат моделей Pydantic
+
+По умолчанию FastAPI сериализует возвращаемое значение в JSON:
+
+```python
+@app.get("/user/")
+async def get_user() -> User:
+    return User(id=1, name="Alice", email="a@b.com", age=30)
+```
+
+FastAPI вызывает `jsonable_encoder()` — функцию, которая рекурсивно преобразует:
+- Pydantic-модели → dict
+- `datetime` → ISO-8601 строку
+- `UUID` → строку
+- `set` → list
+- Enum → значение
+
+А затем `json.dumps()`.
+
+### 4.5.3. StreamingResponse
+
+Критически важен для ML-сервисов, генерирующих данные по частям (токены текста, чанки аудио):
+
+```python
+from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
+
+app = FastAPI()
+
+async def token_generator():
+    tokens = ["Hello", " world", " from", " ML", " model", "!"]
+    for token in tokens:
+        yield token
+        await asyncio.sleep(0.1)  # имитация генерации
+
+@app.get("/stream")
+async def stream_tokens():
+    return StreamingResponse(token_generator(), media_type="text/plain")
+```
+
+Под капотом `StreamingResponse`:
+1. Отправляет `http.response.start` со статусом 200.
+2. В цикле `async for` читает чанки из генератора.
+3. Отправляет `http.response.body` с `more_body=True` для каждого чанка.
+4. Последний чанк отправляет с `more_body=False`.
+
+### 4.5.4. FileResponse
+
+```python
+from fastapi.responses import FileResponse
+
+@app.get("/download/{filename}")
+async def download_file(filename: str):
+    return FileResponse(
+        path=f"/storage/{filename}",
+        filename=filename,
+        media_type="application/octet-stream"
+    )
+```
+
+`FileResponse` использует `sendfile()` системный вызов (где доступен), который копирует данные из файла в сокет **в обход пользовательского пространства** (zero-copy). Это существенно снижает нагрузку на CPU при передаче больших файлов.
+
+---
+
+## 4.6. Обработка ошибок и исключений
+
+### 4.6.1. HTTPException
+
+FastAPI предоставляет стандартный механизм для HTTP-ошибок:
+
+```python
+from fastapi import HTTPException
+
+@app.get("/items/{item_id}")
+async def read_item(item_id: int):
+    if item_id < 0:
+        raise HTTPException(status_code=400, detail="Item ID must be positive")
+    return {"item_id": item_id}
+```
+
+`HTTPException` — это не обычное Python-исключение. Это **сигнал** для FastAPI: «сформируй HTTP-ответ с этим статусом и телом». Она не прерывает выполнение event loop, а лишь меняет путь обработки запроса.
+
+Можно добавить заголовки:
+
+```python
+raise HTTPException(
+    status_code=401,
+    detail="Unauthorized",
+    headers={"WWW-Authenticate": "Bearer"}
+)
+```
+
+### 4.6.2. Кастомные Exception Handlers
+
+В большом приложении разбрасывать `HTTPException` по endpoint'ам — антипаттерн. Бизнес-логика должна выбрасывать **свои** исключения, а фреймворк — превращать их в HTTP-ответы.
+
+**Шаг 1: определяем иерархию исключений**
+
+```python
+class AppException(Exception):
+    """Базовое исключение приложения"""
+    def __init__(self, message: str, status_code: int = 500):
+        self.message = message
+        self.status_code = status_code
+        super().__init__(self.message)
+
+class NotFoundError(AppException):
+    def __init__(self, resource: str, resource_id: str):
+        super().__init__(
+            message=f"{resource} with id={resource_id} not found",
+            status_code=404
+        )
+
+class ValidationError(AppException):
+    def __init__(self, field: str, reason: str):
+        super().__init__(
+            message=f"Validation failed for {field}: {reason}",
+            status_code=422
+        )
+```
+
+**Шаг 2: регистрируем обработчики**
+
+```python
+from fastapi import Request
+from fastapi.responses import JSONResponse
+
+@app.exception_handler(AppException)
+async def app_exception_handler(request: Request, exc: AppException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": exc.message, "type": exc.__class__.__name__}
+    )
+
+@app.exception_handler(NotFoundError)
+async def not_found_handler(request: Request, exc: NotFoundError):
+    # Можно добавить логирование, метрики
+    return JSONResponse(
+        status_code=404,
+        content={"error": exc.message, "resource": "unknown"}
+    )
+```
+
+**Шаг 3: используем в бизнес-логике**
+
+```python
+@app.get("/users/{user_id}")
+async def get_user(user_id: str):
+    user = await user_repository.find_by_id(user_id)
+    if user is None:
+        raise NotFoundError("User", user_id)
+    return user
+```
+
+**Преимущества:**
+- Endpoint'ы не знают о HTTP. Они работают с бизнес-исключениями.
+- Централизованная обработка: можно добавить логирование, трассировку, метрики в одном месте.
+- Иерархия: `AppException` ловит все производные, если нет более специфичного handler'а.
+
+### 4.6.3. Глобальная обработка и логирование
+
+```python
+import logging
+import traceback
+
+logger = logging.getLogger("app")
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    # Логируем непредвиденные ошибки
+    logger.error(
+        f"Unhandled exception: {exc}\n{traceback.format_exc()}",
+        extra={"path": request.url.path, "method": request.method}
+    )
+    
+    return JSONResponse(
+        status_code=500,
+        content={"error": "Internal server error", "request_id": correlation_id.get()}
+    )
+```
+
+**Важно:** handler для `Exception` — ловушка последней инстанции. Она должна возвращать **generic** сообщение, чтобы не раскрывать внутренние детали (пути файлов, структуру БД) злоумышленнику.
+
+---
+
+## 4.7. Middleware: BaseHTTPMiddleware vs чистые ASGI-мидлвари
+
+### 4.7.1. Зачем нужны middleware?
+
+Middleware — это **конвейер** обработки запроса. Каждый middleware может:
+- модифицировать входящий запрос (добавить заголовки, распарсить токен);
+- выполнить код до и после endpoint'а (тайминг, логирование);
+- прервать запрос (аутентификация, rate limiting);
+- модифицировать ответ (добавить CORS-заголовки, сжатие).
+
+### 4.7.2. BaseHTTPMiddleware: простота и скрытая опасность
+
+```python
+from fastapi import Request
+from starlette.middleware.base import BaseHTTPMiddleware
+import time
+
+class TimingMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        start = time.perf_counter()
+        response = await call_next(request)  # ← вызов следующего middleware/endpoint
+        elapsed = time.perf_counter() - start
+        response.headers["X-Process-Time"] = str(elapsed)
+        return response
+
+app.add_middleware(TimingMiddleware)
+```
+
+`BaseHTTPMiddleware` удобен, потому что предоставляет готовые объекты `Request` и `Response`. Но у него есть **фатальный недостаток** для асинхронных приложений.
+
+#### Почему BaseHTTPMiddleware блокирует event loop?
+
+`BaseHTTPMiddleware` оборачивает ASGI-приложение в **синхронный** вызов `call_next`. Под капотом он использует `asyncio.run_coroutine_threadsafe()` или похожий механизм, который создаёт **новую задачу** в event loop и ждёт её через `asyncio.Queue`.
+
+Это означает:
+- Весь response body собирается во временный буфер перед передачей клиенту.
+- **StreamingResponse теряет смысл**: чанки накапливаются в памяти, а не отправляются по мере готовности.
+- При больших ответах происходит **избыточное потребление памяти**.
+- В некоторых сценариях возможен **deadlock**, если middleware вызывает `call_next`, а endpoint пытается отправить данные, но middleware ждёт завершения `call_next`.
+
+**Вывод:** `BaseHTTPMiddleware` приемлем для простых middleware (логирование заголовков, добавление заголовков ответа), но **опасен** для streaming, больших файлов и высоконагруженных систем.
+
+### 4.7.3. Чистые ASGI-мидлвари: полный контроль
+
+Чистая ASGI-middleware — это функция (или класс), которая оборачивает другое ASGI-приложение, перехватывая `scope`, `receive`, `send`.
+
+```python
+class ASGITimingMiddleware:
+    def __init__(self, app):
+        self.app = app  # следующее приложение в цепочке
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            # WebSocket или lifespan пропускаем без изменений
+            await self.app(scope, receive, send)
+            return
+
+        start = time.perf_counter()
+        
+        # Перехватываем send, чтобы измерить время до первого байта
+        async def wrapped_send(message):
+            if message["type"] == "http.response.start":
+                elapsed = time.perf_counter() - start
+                headers = message.get("headers", [])
+                headers.append((b"x-process-time", str(elapsed).encode()))
+                message["headers"] = headers
+            await send(message)
+        
+        await self.app(scope, receive, wrapped_send)
+```
+
+**Преимущества:**
+- Работает на уровне ASGI, без промежуточных абстракций.
+- Поддерживает streaming: `wrapped_send` вызывается для каждого чанка.
+- Нулевые накладные расходы на буферизацию.
+- Полный контроль над lifecycle запроса.
+
+**Недостатки:**
+- Код сложнее: нужно работать с `scope`, `receive`, `send` напрямую.
+- Нет готового объекта `Request` (его можно создать вручную, но это дорого).
+
+### 4.7.4. Порядок выполнения middleware
+
+Middleware в FastAPI образуют **лук** (onion): запрос проходит через них снаружи внутрь, ответ — изнутри наружу.
+
+```python
+app.add_middleware(MiddlewareA)
+app.add_middleware(MiddlewareB)
+app.add_middleware(MiddlewareC)
+
+# Порядок выполнения:
+# Request: C → B → A → Endpoint
+# Response: Endpoint → A → B → C
+```
+
+Это важно для:
+- **Аутентификации**: должна быть ближе к endpoint'у, чтобы логирование уже видело идентификатор пользователя.
+- **CORS**: обычно самый внешний слой.
+- **Сжатия (GZip)**: должно быть после всех модификаций ответа.
+
+### 4.7.5. Математическая подоплека: middleware как композиция функций
+
+Middleware формируют **моноид** под композицией. Каждый middleware $M$ — это функция высшего порядка:
+
+$$M: (Scope \times Receive \times Send \to \text{Awaitable}) \to (Scope \times Receive \times Send \to \text{Awaitable})$$
+
+или короче:
+
+$$M: \text{ASGIApp} \to \text{ASGIApp}$$
+
+Композиция middleware:
+
+$$(M_3 \circ M_2 \circ M_1)(App) = M_3(M_2(M_1(App)))$$
+
+Это ассоциативная операция с нейтральным элементом (тождественное middleware). В функциональном программировании такая структура называется **эндофунктор** (endofunctor) категории ASGI-приложений в себя.
+
+---
+
+## 4.8. Жизненный цикл приложения (Lifespan)
+
+### 4.8.1. Проблема: ресурсы нужно инициализировать один раз
+
+ML-сервис должен:
+1. **При старте**: загрузить модель в GPU/CPU память, установить соединение с базой данных, подключиться к брокеру сообщений.
+2. **При работе**: использовать эти ресурсы в endpoint'ах.
+3. **При остановке**: корректно освободить память, закрыть соединения, дождаться завершения текущих запросов.
+
+В старых фреймворках (Flask, Django) использовались хуки `@app.before_first_request` — но это плохо: первый запрос платит за инициализацию задержкой.
+
+ASGI ввёл протокол **Lifespan**: два события, `startup` и `shutdown`, которые происходят до приёма первого HTTP-запроса и после остановки приёма новых соединений.
+
+### 4.8.2. Lifespan в FastAPI: `@asynccontextmanager`
+
+```python
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+
+ml_model = None  # глобальная переменная для примера
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: выполняется до начала приёма запросов
+    global ml_model
+    ml_model = await load_ml_model()  # тяжёлая асинхронная инициализация
+    app.state.model = ml_model        # сохраняем в app.state
+    print("Модель загружена")
+    
+    yield  # ← здесь приложение начинает обрабатывать запросы
+    
+    # Shutdown: выполняется после остановки сервера
+    await ml_model.dispose()
+    print("Модель освобождена")
+
+app = FastAPI(lifespan=lifespan)
+```
+
+**Что происходит:**
+
+1. Uvicorn запускает приложение.
+2. Отправляет lifespan-событие `startup`.
+3. FastAPI входит в `lifespan`, выполняет код до `yield`.
+4. `yield` передаёт управление Uvicorn — начинается приём HTTP/WebSocket.
+5. Когда Uvicorn получает сигнал остановки (SIGTERM), он перестаёт принимать новые соединения, ждёт завершения текущих.
+6. Отправляет lifespan-событие `shutdown`.
+7. Код после `yield` выполняется — освобождение ресурсов.
+
+### 4.8.3. Управление глобальным состоянием через `app.state`
+
+`app.state` — это объект типа `Starlette.state.State`, хранящий произвольные атрибуты:
+
+```python
+@app.get("/predict")
+async def predict(data: InputData):
+    model = app.state.model
+    result = await model.predict(data.features)
+    return {"prediction": result}
+```
+
+**Почему `app.state`, а не глобальные переменные?**
+- Глобальные переменные в Python — это переменные модуля. При использовании `multiprocessing` (несколько воркеров Uvicorn) каждый процесс имеет **свою** копию глобальных переменных.
+- `app.state` явно привязан к экземпляру приложения и документирует намерение: «это состояние приложения».
+
+### 4.8.4. Graceful shutdown: корректное завершение
+
+Когда Uvicorn получает `SIGTERM`:
+
+1. **Прекращает приём** новых TCP-соединений.
+2. **Ждёт** завершения текущих HTTP-запросов (с таймаутом, по умолчанию 30 секунд).
+3. **Закрывает** WebSocket-соединения.
+4. **Вызывает** lifespan `shutdown`.
+5. **Завершает** процесс.
+
+Важно для ML: если inference занимает 5 секунд, и в момент остановки обрабатывается 10 запросов — Uvicorn подождёт их завершения (в пределах таймаута). Запросы не обрываются посередине.
+
+Можно настроить таймаут:
+
+```bash
+uvicorn main:app --timeout-graceful-shutdown 60
+```
+
+### 4.8.5. AsyncExitStack для сложной инициализации
+
+Если нужно управлять несколькими ресурсами (БД, кэш, ML-модель), удобен `AsyncExitStack`:
+
+```python
+from contextlib import AsyncExitStack
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    async with AsyncExitStack() as stack:
+        db = await create_db_pool()
+        await stack.enter_async_context(db)
+        
+        redis = await create_redis_client()
+        await stack.enter_async_context(redis)
+        
+        model = await load_model()
+        app.state.db = db
+        app.state.redis = redis
+        app.state.model = model
+        
+        yield  # приложение работает
+    
+    # здесь AsyncExitStack автоматически закроет db и redis
+```
+
+`AsyncExitStack` гарантирует, что все ресурсы будут освобождены в **обратном порядке** их создания, даже если одно из освобождений выбросит исключение.
+
+---
+
+## Итог модуля 4
+
+| Концепция | Суть | Практическое применение |
+|-----------|------|------------------------|
+| **ASGI** | Интерфейс `scope/receive/send` для асинхронных веб-приложений | Понимание, как Uvicorn взаимодействует с FastAPI |
+| **Uvicorn** | ASGI-сервер на `uvloop` + `httptools` | Запуск продакшн-сервера |
+| **Type-driven** | Типы = валидация + документация | Меньше кода, меньше багов |
+| **Pydantic V2** | Ядро на Rust, zero-copy | Валидация со скоростью, близкой к C |
+| **Exception Handler** | Централизованная обработка ошибок | Чистая бизнес-логика, единый формат ошибок |
+| **BaseHTTPMiddleware** | Простой, но опасен для streaming | Только для простых middleware |
+| **ASGI Middleware** | Полный контроль, нет накладных расходов | Streaming, логирование, rate limiting |
+| **Lifespan** | `startup`/`shutdown` через `@asynccontextmanager` | Загрузка ML-моделей, пулы соединений |
+| **app.state** | Глобальное состояние приложения | Хранение модели, доступной из endpoint'ов |
+
+В **Модуле 5** мы разберём Dependency Injection — систему `Depends`, которая позволяет строить масштабируемую архитектуру, не создавая глобальных переменных и не разбрасывая инициализацию ресурсов по endpoint'ам.
