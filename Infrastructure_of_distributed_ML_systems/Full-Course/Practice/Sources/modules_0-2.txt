@@ -1,0 +1,1005 @@
+## Семинар: «От процесса к контейнеру»
+### Практическое освоение фундамента Linux, изоляции и Docker
+
+**Цель семинара:** пройти путь от голой ОС до production-ready контейнера, выполняя каждую команду в терминале и понимая, что именно происходит под капотом. К концу семинара вы должны уметь объяснить любому инженеру, почему ваш Dockerfile написан именно так, а не иначе.
+
+---
+
+## Часть 1. Подготовка песочницы
+
+### 1.1. Установка Docker
+
+**Linux (Ubuntu/Debian):**
+```bash
+# Обновляем индекс пакетов
+sudo apt-get update
+
+# Устанавливаем зависимости для работы с HTTPS-репозиториями
+sudo apt-get install -y ca-certificates curl gnupg
+
+# Добавляем официальный GPG-ключ Docker
+sudo install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | \
+    sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+sudo chmod a+r /etc/apt/keyrings/docker.gpg
+
+# Добавляем репозиторий Docker в APT
+echo \
+  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+  https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+  sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+# Устанавливаем Docker Engine, containerd и Docker Compose
+sudo apt-get update
+sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+```
+
+**Почему так много пакетов?**
+- `docker-ce` — сам демон (dockerd) и CLI.
+- `containerd.io` — runtime, управляющий жизненным циклом контейнеров (см. Модуль 2.1.1).
+- `docker-buildx-plugin` — BuildKit (современный билдер).
+- `docker-compose-plugin` — плагин для `docker compose` (v2).
+
+**macOS / Windows:**
+Установите **Docker Desktop**. На Windows обязательно включите WSL2-backend (Windows Subsystem for Linux), иначе Docker работает через виртуальную машину Hyper-V, что добавляет слой абстракции и ломает некоторые нюансы с namespaces.
+
+### 1.2. Первая команда и её построчный разбор
+
+```bash
+sudo docker run hello-world
+```
+
+**Если вы видите `permission denied` без `sudo`:**
+Демон Docker слушает Unix-сокет `/var/run/docker.sock`, принадлежащий группе `docker`. Добавьте себя в группу:
+```bash
+sudo usermod -aG docker $USER
+newgrp docker  # Применяем изменения без перелогина
+```
+
+**Разбор вывода `hello-world`:**
+
+```
+Unable to find image 'hello-world:latest' locally
+```
+Docker проверил локальное хранилище образов. Образа нет — нужно скачать.
+
+```
+latest: Pulling from library/hello-world
+c1ec31eb5944: Pull complete
+```
+Скачивается слой `c1ec31eb5944` (SHA-256 дайджест первых 12 символов). Это единственный слой образа `hello-world`. Образ адресуется по content hash (см. Модуль 2.1.3).
+
+```
+Digest: sha256:4bd78111b6914a99dbc560e6a20eab57ff6655aea4a76c64c0fb17eb4a9056e2
+Status: Downloaded newer image for hello-world:latest
+```
+Скачивание завершено. Дайджест — это «паспорт» образа. Два образа с одинаковым тегом `hello-world:latest` на разных машинах могут иметь разные дайджесты, если тег был перезаписан.
+
+```
+Hello from Docker!
+This message shows that your installation appears to be working correctly.
+...
+```
+Контейнер запустился, выполнил свою единственную задачу (напечатать текст) и завершился.
+
+**Проверим, что контейнер действительно завершился:**
+```bash
+docker ps          # Активные контейнеры — пусто
+docker ps -a       # Все контейнеры, включая остановленные
+```
+Вы увидите запись вида:
+```
+CONTAINER ID   IMAGE           COMMAND    CREATED          STATUS                      PORTS     NAMES
+a1b2c3d4e5f6   hello-world     "/hello"   10 seconds ago   Exited (0) 9 seconds ago             hopeful_archimedes
+```
+`Exited (0)` — код возврата 0 (успех). Контейнер существует как объект (можно посмотреть логи `docker logs a1b2c3d4e5f6`), но не потребляет CPU/RAM. Его writable layer всё ещё занимает место на диске.
+
+**Удалим контейнер и образ, чтобы не мусорить:**
+```bash
+docker rm a1b2c3d4e5f6      # Удаляем контейнер (writable layer)
+docker rmi hello-world       # Удаляем образ (read-only слои)
+```
+
+---
+
+## Часть 2. Погружение в Linux внутри контейнера (Модуль 1 на практике)
+
+### 2.1. Запуск интерактивного контейнера и первые шаги
+
+```bash
+docker run -it --rm ubuntu:22.04 bash
+```
+
+**Флаги:**
+- `-i` (interactive) — держать STDIN открытым, даже если не прикреплён терминал.
+- `-t` (tty) — выделить псевдотерминал (чтобы `bash` думал, что он работает в терминале, и показывал приглашение).
+- `--rm` — автоматически удалить контейнер после выхода (не оставлять мёртвый контейнер в `docker ps -a`).
+- `ubuntu:22.04` — образ (репозиторий `ubuntu`, тег `22.04`).
+- `bash` — команда, которую выполнить внутри контейнера (заменяет `CMD` образа).
+
+Вы попали внутрь контейнера. Приглашение изменилось — теперь вы root внутри изолированной среды.
+
+### 2.2. Процессы и PID namespace
+
+```bash
+# Внутри контейнера выполняем:
+ps aux
+```
+
+Вывод:
+```
+USER       PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND
+root         1  0.0  0.0   4628  2840 pts/0    Ss   10:00   0:00 bash
+root         9  0.0  0.0   7064  1540 pts/0    R+   10:01   0:00 ps aux
+```
+
+**Ключевое наблюдение:** `bash` имеет PID 1. Но на хосте этот процесс имеет совершенно другой PID. Это работа **PID namespace** (см. Модуль 1.2.1). Контейнер видит только процессы своего namespace. Для него его `bash` — это первый процесс в системе.
+
+**Проверим на хосте (второй терминал):**
+```bash
+# На хосте:
+docker top <container_id>
+```
+Или:
+```bash
+ps aux | grep bash
+```
+Вы увидите, что тот же `bash` на хосте имеет PID, например, `3421`, а внутри контейнера — `1`.
+
+**Посмотрим дерево процессов:**
+```bash
+# Внутри контейнера:
+pstree -p
+```
+Вывод: `bash(1)---pstree(10)`. Всего два процесса в namespace.
+
+### 2.3. Файловая система и OverlayFS
+
+```bash
+# Внутри контейнера:
+ls /
+```
+Вы увидите стандартную Unix-иерархию: `bin`, `boot`, `dev`, `etc`, `home`, `lib`, `proc`, `root`, `sys`, `tmp`, `usr`, `var`.
+
+**Посмотрим, какая файловая система смонтирована:**
+```bash
+mount | grep overlay
+```
+
+Вывод (примерно):
+```
+overlay on / type overlay (rw,relatime,lowerdir=/var/lib/docker/overlay2/l/ABC123:/var/lib/docker/overlay2/l/DEF456,upperdir=/var/lib/docker/overlay2/<id>/diff,workdir=/var/lib/docker/overlay2/<id>/work)
+```
+
+**Разбор:**
+- `overlay on /` — корневая файловая система контейнера — это OverlayFS.
+- `lowerdir` — список read-only слоёв образа (базовый Ubuntu + изменения).
+- `upperdir` — writable layer контейнера (`/var/lib/docker/overlay2/<id>/diff`).
+- `workdir` — рабочая директория OverlayFS.
+
+**Создадим файл и проверим, где он появится:**
+```bash
+# Внутри контейнера:
+echo "test" > /myfile.txt
+```
+
+**На хосте (в другом терминале):**
+```bash
+sudo ls /var/lib/docker/overlay2/<id>/diff/
+```
+Вы увидите `myfile.txt` в `upperdir`. Файл не попал в образ — он живёт только в writable layer этого конкретного контейнера.
+
+**Удалим контейнер и проверим исчезновение:**
+```bash
+exit  # Внутри контейнера — он остановится и удалится из-за --rm
+sudo ls /var/lib/docker/overlay2/<id>/diff/
+```
+Директория исчезла. Данные потеряны. Это демонстрирует эфемерность контейнера без volumes.
+
+### 2.4. Cgroups на практике
+
+Запустим контейнер с ограничениями и посмотрим, как они применяются:
+
+```bash
+docker run -it --rm --memory="512m" --cpus="1.5" ubuntu:22.04 bash
+```
+
+**Внутри контейнера проверим cgroup v1 или v2:**
+
+```bash
+# Для cgroup v2 (современные системы):
+cat /sys/fs/cgroup/memory.max
+# Вывод: 536870912 (512 * 1024 * 1024 байт)
+
+cat /sys/fs/cgroup/cpu.max
+# Вывод: 150000 100000 (1.5 CPU = 150ms на каждые 100ms)
+
+cat /sys/fs/cgroup/pids.max
+# Вывод: max (по умолчанию не ограничено, можно задать --pids-limit)
+```
+
+**Для cgroup v1 (устаревшие системы):**
+```bash
+cat /sys/fs/cgroup/memory/memory.limit_in_bytes
+cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us
+cat /sys/fs/cgroup/cpu/cpu.cfs_period_us
+```
+
+Это прямое подтверждение работы cgroups (Модуль 1.2.2). Docker создал cgroup для контейнера и записал в неё лимиты.
+
+### 2.5. Сетевой namespace
+
+```bash
+docker run -it --rm ubuntu:22.04 bash
+```
+
+```bash
+# Внутри контейнера:
+ip addr
+```
+
+Вывод:
+```
+1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN group default qlen 1000
+    inet 127.0.0.1/8 scope host lo
+2: eth0@if123: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue state UP group default
+    inet 172.17.0.2/16 brd 172.17.255.255 scope global eth0
+```
+
+**Разбор:**
+- `lo` — loopback (localhost).
+- `eth0` — виртуальный интерфейс. `172.17.0.2/16` — IP из подсети Docker bridge (`docker0` на хосте).
+- `@if123` — это veth pair. На хосте существует интерфейс `vethxxxxxx` с индексом 123, соединённый с этим `eth0` виртуальным кабелем.
+
+```bash
+# Внутри контейнера:
+ip route
+```
+Вывод:
+```
+default via 172.17.0.1 dev eth0
+172.17.0.0/16 dev eth0 proto kernel scope link src 172.17.0.2
+```
+Шлюз по умолчанию — `172.17.0.1`. Это IP интерфейса `docker0` на хосте. Контейнер выходит в интернет через NAT (Модуль 1.4.4).
+
+Проверим связь:
+```bash
+ping -c 3 8.8.8.8   # Работает, если контейнеру разрешён выход в интернет
+ping -c 3 host.docker.internal  # Специальный DNS для хоста (Docker Desktop)
+```
+
+### 2.6. Виртуальная память и файловые дескрипторы
+
+```bash
+# Внутри контейнера:
+cat /proc/1/maps | head -20
+```
+Это карта виртуальной памяти процесса `bash` (PID 1 в namespace). Вы видите:
+- Адреса сегментов: код (`r-xp`), данные (`r--p`), heap, stack, shared libraries.
+- Путь к библиотекам: `/lib/x86_64-linux-gnu/libc.so.6` и т.д.
+
+```bash
+ls -la /proc/1/fd/
+```
+Таблица файловых дескрипторов процесса (Модуль 1.1.3):
+- `0 -> /dev/pts/0` (stdin, терминал)
+- `1 -> /dev/pts/0` (stdout)
+- `2 -> /dev/pts/0` (stderr)
+
+```bash
+ls -la /proc/self/fd/
+```
+`self` — это symlink на PID текущего процесса (`ls`).
+
+**Выходим из контейнера:**
+```bash
+exit
+```
+
+---
+
+## Часть 3. Пишем первый Dockerfile (Модуль 2 на практике)
+
+### 3.1. Создаём проект
+
+```bash
+mkdir ~/docker-seminar && cd ~/docker-seminar
+mkdir src
+```
+
+Создаём файл `src/main.py`:
+```python
+import os
+import sys
+import time
+
+print(f"Python version: {sys.version}")
+print(f"Environment MODE: {os.getenv('MODE', 'development')}")
+
+# Имитируем "работу"
+for i in range(5):
+    print(f"Working... {i+1}/5", flush=True)
+    time.sleep(1)
+
+print("Done!")
+```
+
+### 3.2. Простейший Dockerfile
+
+Создаём `Dockerfile` (без расширения):
+```dockerfile
+FROM python:3.11
+COPY . /app
+WORKDIR /app
+RUN pip install flask
+ENV MODE=production
+CMD ["python", "src/main.py"]
+```
+
+**Собираем:**
+```bash
+docker build -t myapp:v1 .
+```
+
+**Разбор флагов:**
+- `-t myapp:v1` — тег (имя:тег). Если тег не указан, используется `latest`.
+- `.` — build context (текущая директория). Docker CLI архивирует её и отправляет демону.
+
+**Смотрим вывод сборки:**
+```
+[+] Building 15.2s (8/8) FINISHED
+ => [internal] load build definition from Dockerfile
+ => => transferring dockerfile: 142B
+ => [internal] load .dockerignore
+ => => transferring context: 2B
+ => [internal] load metadata for docker.io/library/python:3.11
+ => [1/4] FROM docker.io/library/python:3.11
+ => [internal] load build context
+ => => transferring context: 234B
+ => [2/4] COPY . /app
+ => [3/4] WORKDIR /app
+ => [4/4] RUN pip install flask
+ => exporting to image
+ => => exporting layers
+ => => writing image sha256:abc123...
+ => => naming to docker.io/library/myapp:v1
+```
+
+**Запускаем:**
+```bash
+docker run myapp:v1
+```
+
+**Проблема:** `pip install flask` выполняется при каждой сборке, даже если мы меняем только `main.py`. Почему? Потому что `COPY . /app` копирует ВСЁ, включая `main.py`. Если мы меняем `main.py`, меняется build context, инвалируется кэш слоя `COPY . /app`, и все последующие инструкции (`RUN pip install`, `ENV`, `CMD`) пересобираются.
+
+### 3.3. Оптимизация: правильный порядок инструкций
+
+Перепишем `Dockerfile`:
+```dockerfile
+FROM python:3.11
+
+WORKDIR /app
+
+# Сначала копируем ТОЛЬКО requirements (редко меняется)
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Теперь копируем код (меняется часто)
+COPY src/ ./src/
+
+ENV MODE=production
+CMD ["python", "src/main.py"]
+```
+
+Создаём `requirements.txt`:
+```
+flask==3.0.0
+```
+
+**Собираем:**
+```bash
+docker build -t myapp:v2 .
+```
+
+**Проверяем кэширование.** Измените `src/main.py` (добавьте строку) и пересоберите:
+```bash
+docker build -t myapp:v2 .
+```
+Вы увидите:
+```
+ => [1/5] FROM docker.io/library/python:3.11
+ => CACHED [2/5] WORKDIR /app
+ => CACHED [3/5] COPY requirements.txt .
+ => CACHED [4/5] RUN pip install --no-cache-dir -r requirements.txt
+ => [5/5] COPY src/ ./src/
+```
+Слои 1–4 взяты из кэша. Пересобирается только слой 5 (`COPY src/`). Установка зависимостей не повторяется.
+
+**Смотрим историю образа:**
+```bash
+docker history myapp:v2
+```
+
+Вывод (примерный):
+```
+IMAGE          CREATED         CREATED BY                                      SIZE
+abc123         2 minutes ago   CMD ["python" "src/main.py"]                    0B
+def456         2 minutes ago   ENV MODE=production                             0B
+ghi789         2 minutes ago   COPY src/ ./src/ # buildkit                    234B
+jkl012         5 minutes ago   RUN pip install --no-cache-dir -r requirements…  25.3MB
+mno345         5 minutes ago   COPY requirements.txt . # buildkit               12B
+pqr678         5 minutes ago   WORKDIR /app                                    0B
+stu901         2 days ago      /bin/sh -c #(nop)  CMD ["python3"]              0B
+...
+```
+Размер каждого слоя показывает, сколько данных он добавил. `RUN pip install` добавил 25.3 МБ (Flask + зависимости).
+
+### 3.4. .dockerignore
+
+Создаём файл `.dockerignore` в корне проекта:
+```
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+.venv
+venv/
+
+# IDE
+.vscode
+.idea
+
+# Локальные данные
+*.log
+.env
+```
+
+**Проверим, что игнорируется:**
+```bash
+echo "SECRET_KEY=12345" > .env
+docker build -t myapp:v3 .
+```
+
+Даже если вы случайно сделаете `COPY . /app`, `.env` не попадёт в образ. Это критично для безопасности.
+
+### 3.5. BuildKit и продвинутое кэширование
+
+BuildKit включён по умолчанию. Убедимся:
+```bash
+docker buildx version
+```
+
+**Используем cache mount для pip:**
+```dockerfile
+# syntax=docker/dockerfile:1
+FROM python:3.11
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r requirements.txt
+
+COPY src/ ./src/
+CMD ["python", "src/main.py"]
+```
+
+**Разбор:**
+- `# syntax=docker/dockerfile:1` — включает последние возможности Dockerfile.
+- `--mount=type=cache,target=/root/.cache/pip` — монтирует persistent cache-директорию между сборками. `pip` кэширует скачанные wheel-файлы. При следующей сборке (даже если `requirements.txt` изменился) pip не скачивает заново неизменённые пакеты.
+- Этот кэш НЕ попадает в итоговый образ.
+
+**Собираем дважды** и замерьте время второй сборки — оно будет значительно меньше.
+
+---
+
+## Часть 4. Многоэтапная сборка (Модуль 2.4 на практике)
+
+### 4.1. Проблема: образ с компилятором
+
+Создадим приложение, требующее компиляции C-расширений. Файл `src/calc.py`:
+```python
+import numpy as np
+
+data = np.random.rand(1000, 1000)
+result = np.dot(data, data.T)
+print(f"Matrix shape: {result.shape}")
+print(f"Trace: {np.trace(result):.4f}")
+```
+
+`requirements.txt`:
+```
+numpy==1.26.0
+```
+
+**Простой Dockerfile (антипаттерн):**
+```dockerfile
+FROM python:3.11
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install numpy==1.26.0
+COPY src/ ./src/
+CMD ["python", "src/calc.py"]
+```
+
+Соберём и посмотрим размер:
+```bash
+docker build -t myapp-fat .
+docker images myapp-fat
+```
+Размер: ~1.2 ГБ (базовый `python:3.11` ≈ 900 МБ + numpy с зависимостями).
+
+### 4.2. Multi-stage build
+
+Перепишем:
+```dockerfile
+# Этап 1: Сборка (builder)
+FROM python:3.11 AS builder
+
+WORKDIR /build
+COPY requirements.txt .
+
+# Устанавливаем в пользовательскую директорию
+RUN pip install --user --no-cache-dir -r requirements.txt
+
+# Этап 2: Рантайм
+FROM python:3.11-slim AS runtime
+
+WORKDIR /app
+
+# Копируем установленные пакеты из builder
+COPY --from=builder /root/.local /root/.local
+ENV PATH=/root/.local/bin:$PATH
+
+# Копируем код
+COPY src/ ./src/
+
+CMD ["python", "src/calc.py"]
+```
+
+**Собираем и сравниваем:**
+```bash
+docker build -t myapp-slim .
+docker images | grep myapp
+```
+
+| Образ | Размер |
+|---|---|
+| `myapp-fat` | ~1.2 GB |
+| `myapp-slim` | ~180 MB |
+
+**Почему такая разница?**
+- `python:3.11` содержит `gcc`, `g++`, `build-essential`, `git`, `curl`, man-страницы.
+- `python:3.11-slim` — минимальный образ с Python и базовыми shared libraries.
+- `COPY --from=builder` переносит только скомпилированные `.so` и `.py` файлы из `/root/.local`, не перенося компиляторы.
+
+### 4.3. Анализ образа с dive
+
+Установите `dive` (https://github.com/wagoodman/dive):
+```bash
+# Ubuntu/Debian
+wget https://github.com/wagoodman/dive/releases/download/v0.12.0/dive_0.12.0_linux_amd64.deb
+sudo dpkg -i dive_0.12.0_linux_amd64.deb
+
+dive myapp-slim
+```
+
+**Интерфейс dive:**
+- **Левая панель:** слои образа. Выбирая слой, вы видите, какие файлы он добавил.
+- **Правая панель:** файловая система. Зелёные файлы — добавленные в текущем слое, жёлтые — изменённые, красные — удалённые.
+- **Внизу:** метрика efficiency. Если efficiency < 100%, значит есть overwritten файлы (память тратится впустую).
+
+**Проверим `myapp-fat`:**
+```bash
+dive myapp-fat
+```
+Вы увидите огромные слои с `gcc`, `libc6-dev`, `linux-libc-dev`. Эти файлы не нужны в рантайме, но занимают место.
+
+---
+
+## Часть 5. Сети и коммуникация контейнеров (Модуль 1.4 + 2.5)
+
+### 5.1. Создаём пользовательскую сеть
+
+```bash
+docker network create mynet
+```
+
+**Запускаем два контейнера в этой сети:**
+```bash
+# Терминал 1 — "сервер"
+docker run -it --rm --name server --network mynet ubuntu:22.04 bash
+
+# Терминал 2 — "клиент"
+docker run -it --rm --name client --network mynet ubuntu:22.04 bash
+```
+
+**Внутри "клиента":**
+```bash
+ping -c 3 server
+```
+DNS работает! Docker встроенный resolver преобразует имя `server` в IP контейнера `server`. Это **spatial decoupling** (Модуль 0.2.2): клиент не знает IP сервера, он знает только имя.
+
+```bash
+# Узнаём IP сервера
+getent hosts server
+```
+
+**Внутри "сервера":**
+```bash
+apt-get update && apt-get install -y netcat-openbsd
+nc -lk -p 8080  # Слушаем порт 8080
+```
+
+**Внутри "клиента":**
+```bash
+apt-get update && apt-get install -y netcat-openbsd
+echo "Hello from client" | nc server 8080
+```
+
+На стороне сервера появится сообщение. Контейнеры общаются по L2-сети через Docker bridge. Никакого port mapping (`-p`) не требуется — это внутренняя коммуникация.
+
+### 5.2. Port mapping
+
+Запустим Python HTTP-сервер в контейнере и обратимся к нему с хоста:
+
+```bash
+docker run -d --rm --name web -p 8080:8000 python:3.11-slim \
+    python -m http.server 8000
+```
+
+**Флаг `-p 8080:8000`:**
+- `8080` — порт на хосте (ваша машина).
+- `8000` — порт внутри контейнера.
+
+**Проверка:**
+```bash
+curl http://localhost:8080
+```
+Вы получите ответ от Python HTTP-сервера, работающего внутри контейнера. Docker настроил правило NAT в iptables:
+```bash
+sudo iptables -t nat -L DOCKER -n | grep 8080
+```
+
+### 5.3. Изоляция через --network none
+
+```bash
+docker run -it --rm --network none ubuntu:22.04 bash
+```
+
+```bash
+# Внутри:
+ip addr
+```
+Только `lo` (127.0.0.1). Нет `eth0`. Контейнер полностью изолирован от сети. Полезно для обработки секретных данных, которые не должны покидать контейнер.
+
+---
+
+## Часть 6. Безопасность (Модуль 2.5)
+
+### 6.1. Запуск от не-root пользователя
+
+Создадим безопасный Dockerfile:
+```dockerfile
+FROM python:3.11-slim
+
+# Создаём пользователя и группу
+RUN groupadd -r appgroup && useradd -r -g appgroup appuser
+
+WORKDIR /app
+
+# Копируем код от root, но меняем владельца
+COPY --chown=appuser:appgroup src/ ./src/
+
+# Переключаемся на непривилегированного пользователя
+USER appuser
+
+CMD ["python", "src/main.py"]
+```
+
+**Собираем и проверяем:**
+```bash
+docker build -t myapp-secure .
+docker run --rm myapp-secure
+```
+
+**Проверим, что мы не root:**
+```bash
+docker run --rm myapp-secure whoami
+# Вывод: appuser
+
+docker run --rm myapp-secure id
+# uid=999(appuser) gid=999(appgroup) groups=999(appgroup)
+```
+
+**Попытка записи в корень:**
+```bash
+docker run --rm myapp-secure touch /hack.txt
+```
+Ошибка: `Permission denied`. Даже если злоумышленник получит RCE, он не сможет записать в системные директории.
+
+### 6.2. Read-only rootfs
+
+```bash
+docker run --rm --read-only myapp-secure
+```
+
+Корневая файловая система смонтирована read-only. Но наше приложение пытается писать? Если да — нужен volume для временных данных:
+```bash
+docker run --rm --read-only -v /tmp myapp-secure
+```
+`-v /tmp` создаёт анонимный volume, монтируемый в `/tmp` с правами записи.
+
+### 6.3. Capabilities
+
+```bash
+# Запуск с удалением ВСЕХ capabilities, добавляем обратно только необходимые
+docker run --rm --cap-drop=ALL --cap-add=NET_BIND_SERVICE myapp-secure
+```
+
+Проверим, что `ping` не работает (требует `CAP_NET_RAW`):
+```bash
+docker run --rm --cap-drop=ALL ubuntu:22.04 ping -c 1 8.8.8.8
+# Ошибка: ping: socket: Operation not permitted
+```
+
+### 6.4. Проверка уязвимостей
+
+```bash
+# Установите trivy (https://aquasecurity.github.io/trivy/)
+trivy image myapp-fat
+trivy image myapp-slim
+```
+
+`trivy` просканирует установленные OS-пакеты и Python-зависимости по базе CVE. `myapp-slim` покажет меньше уязвимостей, потому что в нём меньше пакетов.
+
+---
+
+## Часть 7. Финальный проект семинара: «Мини-ML-сервис»
+
+### 7.1. Архитектура
+
+Создадим сервис, который:
+1. Принимает через переменные окружения конфигурацию.
+2. Загружает «модель» (в нашем случае — просто numpy-операцию).
+3. Пишет логи в файл.
+4. Работает от не-root пользователя.
+5. Собирается через multi-stage build.
+6. Запускается через Docker Compose.
+
+### 7.2. Файлы проекта
+
+**`src/service.py`:**
+```python
+import os
+import time
+import json
+import numpy as np
+
+# Конфигурация из окружения
+model_type = os.getenv("MODEL_TYPE", "linear")
+log_path = os.getenv("LOG_PATH", "/app/logs/inference.log")
+
+# Создаём директорию для логов
+os.makedirs(os.path.dirname(log_path), exist_ok=True)
+
+# "Inference"
+data = np.random.rand(100, 100)
+if model_type == "linear":
+    result = np.dot(data, data.T)
+else:
+    result = np.fft.fft2(data)
+
+# Логируем
+with open(log_path, "a") as f:
+    log_entry = {
+        "timestamp": time.time(),
+        "model": model_type,
+        "input_shape": list(data.shape),
+        "output_shape": list(result.shape),
+        "trace": float(np.trace(result.real))
+    }
+    f.write(json.dumps(log_entry) + "\n")
+
+print(f"Inference complete. Model: {model_type}, Trace: {np.trace(result.real):.4f}")
+print(f"Log written to: {log_path}")
+```
+
+**`requirements.txt`:**
+```
+numpy==1.26.0
+```
+
+**`Dockerfile`:**
+```dockerfile
+# syntax=docker/dockerfile:1
+
+# === ЭТАП 1: Сборка ===
+FROM python:3.11 AS builder
+
+WORKDIR /build
+COPY requirements.txt .
+
+RUN pip install --user --no-cache-dir -r requirements.txt
+
+# === ЭТАП 2: Рантайм ===
+FROM python:3.11-slim AS runtime
+
+# Создаём не-root пользователя
+RUN groupadd -r mlgroup && useradd -r -g mlgroup mluser
+
+WORKDIR /app
+
+# Копируем зависимости из builder
+COPY --from=builder /root/.local /home/mluser/.local
+RUN chown -R mluser:mlgroup /home/mluser/.local
+
+# Копируем код
+COPY --chown=mluser:mlgroup src/ ./src/
+
+# Создаём директорию для логов (владелец — mluser)
+RUN mkdir -p /app/logs && chown -R mluser:mlgroup /app/logs
+
+# Переменные окружения
+ENV PATH=/home/mluser/.local/bin:$PATH
+ENV MODEL_TYPE=linear
+ENV LOG_PATH=/app/logs/inference.log
+
+# Переключаемся на непривилегированного пользователя
+USER mluser
+
+# Read-only rootfs + volume для логов будет настроен в Compose
+CMD ["python", "src/service.py"]
+```
+
+**`.dockerignore`:**
+```
+.git
+__pycache__
+*.pyc
+.env
+*.log
+logs/
+```
+
+**`docker-compose.yml`:**
+```yaml
+version: "3.9"
+
+services:
+  ml-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ml-inference
+    environment:
+      - MODEL_TYPE=linear
+      - LOG_PATH=/app/logs/inference.log
+    volumes:
+      - ml-logs:/app/logs
+    read_only: true
+    cap_drop:
+      - ALL
+    networks:
+      - mlnet
+    restart: unless-stopped
+
+volumes:
+  ml-logs:
+    driver: local
+
+networks:
+  mlnet:
+    driver: bridge
+```
+
+### 7.3. Сборка и запуск
+
+```bash
+cd ~/docker-seminar
+
+# Собираем и запускаем
+docker compose up --build
+```
+
+**Разбор `docker-compose.yml`:**
+- `build: context: .` — build context = текущая директория.
+- `volumes: ml-logs:/app/logs` — named volume (персистентное хранилище). Даже при `--rm` или пересоздании контейнера логи сохранятся.
+- `read_only: true` — корневая ФС read-only (как `--read-only`).
+- `cap_drop: ALL` — удаляем все capabilities.
+- `networks: mlnet` — изолированная пользовательская bridge-сеть.
+- `restart: unless-stopped` — перезапускать при падении, но не при явной остановке.
+
+**Проверяем логи:**
+```bash
+# Смотрим вывод сервиса
+docker compose logs
+
+# Проверяем, что логи в volume
+docker volume inspect docker-seminar_ml-logs
+
+# Смотрим содержимое volume (через вспомогательный контейнер)
+docker run --rm -v docker-seminar_ml-logs:/logs ubuntu:22.04 cat /logs/inference.log
+```
+
+**Запускаем несколько раз:**
+```bash
+docker compose up --build
+docker compose up
+docker compose up
+```
+
+Каждый запуск добавляет новую строку в `inference.log`. Volume сохраняет данные между запусками.
+
+### 7.4. Проверка изоляции
+
+```bash
+# Проверим, что контейнер работает от mluser
+docker compose exec ml-service id
+# uid=999(mluser) gid=999(mlgroup) groups=999(mlgroup)
+
+# Проверим capabilities
+docker compose exec ml-service capsh --print
+# Вывод: Current: = (пусто, т.к. ALL сброшены)
+
+# Проверим, что корневая ФС read-only
+docker compose exec ml-service touch /hack.txt
+# Read-only file system
+```
+
+### 7.5. Очистка
+
+```bash
+# Останавливаем и удаляем контейнеры
+docker compose down
+
+# Удаляем volume (логи)
+docker compose down -v
+
+# Удаляем образы
+docker rmi docker-seminar-ml-service
+```
+
+---
+
+## Чек-лист самопроверки
+
+Пройдя этот семинар, вы должны уметь:
+
+- [ ] Объяснить, почему `docker run hello-world` сначала скачивает образ, а потом запускает контейнер.
+- [ ] Показать PID namespace: объяснить, почему `bash` внутри контейнера имеет PID 1.
+- [ ] Найти `upperdir` и `lowerdir` OverlayFS для запущенного контейнера.
+- [ ] Прочитать лимиты cgroup (`memory.max`, `cpu.max`) изнутри контейнера.
+- [ ] Объяснить разницу между `COPY` и `ADD`; между `ENV` и `ARG`; между shell- и exec-формой `CMD`.
+- [ ] Оптимизировать Dockerfile для максимального cache hit (порядок инструкций, `.dockerignore`).
+- [ ] Собрать multi-stage образ и объяснить, почему он в 5–10 раз меньше обычного.
+- [ ] Проанализировать образ с `docker history` и `dive`.
+- [ ] Настроить коммуникацию между контейнерами по имени через user-defined bridge.
+- [ ] Объяснить, зачем нужен не-root пользователь, `--read-only`, `--cap-drop`.
+- [ ] Написать `docker-compose.yml` с volume, network, environment, read_only и cap_drop.
+
+---
+
+## Связь с теорией
+
+| Практика из семинара | Теоретический фундамент (Модули 0–2) |
+|---|---|
+| `docker run -it ubuntu bash` + `ps aux` | PID namespace (Модуль 1.2.1) |
+| `mount \| grep overlay` | OverlayFS, lowerdir/upperdir (Модуль 1.3.4) |
+| `cat /sys/fs/cgroup/memory.max` | Cgroups v2 (Модуль 1.2.2) |
+| `ip addr` внутри контейнера | Network namespace, veth pair, NAT (Модуль 1.2.1, 1.4.4) |
+| `COPY requirements.txt` до `COPY .` | Кэширование слоёв, порядок инструкций (Модуль 2.2.4) |
+| `AS builder` + `COPY --from=builder` | Multi-stage builds, избавление от build-зависимостей (Модуль 2.4) |
+| `USER appuser`, `--read-only`, `--cap-drop` | Capabilities, least privilege, defense in depth (Модуль 1.2.3, 2.5.4) |
+| `docker network create` + `--network mynet` | User-defined bridges, DNS discovery, spatial decoupling (Модуль 0.2.2, 2.5.1) |
+| Named volumes в Compose | Volume-абстракции, персистентность (Модуль 3.2 — предварительно) |
+| `trivy image` | Security scanning, CVE (Модуль 2.4.4) |
+
+---
+
+**Переход к следующему шагу:** после отработки этого семинара вы готовы к Модулю 3 — изучению Docker Compose как инструмента оркестрации мультисервисных приложений (связка API + БД + брокер сообщений) с полным пониманием того, что происходит под капотом каждой команды.

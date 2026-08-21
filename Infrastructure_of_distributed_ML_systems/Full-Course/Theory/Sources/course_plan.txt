@@ -1,0 +1,429 @@
+**Название курса:** «Инфраструктура распределённых ML-систем: контейнеризация, брокеры сообщений и потоковая обработка»
+
+**Цель курса:** с нуля построить фундаментальное понимание того, как изолировать приложения, организовать асинхронную коммуникацию между компонентами и обеспечить отказоустойчивость и масштабируемость ML-сервисов и backend-приложений в продакшене.
+
+---
+
+## Модуль 0. Пролог: почему инфраструктура — это фундамент
+
+**0.1. Парадокс современного бэкенда**
+- Код пишется за дни, а ломается в инфраструктуре: dependency hell, «работает на моей машине», конфликты версий CUDA/BLAS.
+- ML-специфика: модели тяжёлые, inference непредсказуем по времени, требуется строгая изоляция среды.
+- От монолита к распределённой системе: зачем нельзя просто «вызвать функцию» между сервисами.
+
+**0.2. Ландшафт решений**
+- Виртуализация vs контейнеризация vs serverless.
+- Синхронный RPC vs асинхронные очереди: temporal coupling и spatial coupling.
+- Roadmap курса: от механики Linux до production-grade пайплайна Kafka + Celery + Docker.
+
+---
+
+## Модуль 1. Фундамент: процессы, изоляция и сетевая модель
+
+**1.1. Процессы, потоки и адресное пространство в Linux**
+- Процесс: PID, виртуальная память, таблица файловых дескрипторов. Системные вызовы `fork`, `clone`, `exec`.
+- Потоки ядра vs пользовательские потоки. Планировщик ОС: CFS (Completely Fair Scheduler).
+- Файловые дескрипторы, `stdin/stdout/stderr`, pipe-ы.
+
+**1.2. Механизмы изоляции ОС**
+- **Namespaces:** PID, NET, MNT, UTS, IPC, USER, CGROUP. Как ядро создаёт видимость «отдельной системы».
+- **Cgroups v1/v2:** ограничение CPU (shares, quotas, period), памяти (limits, swap), I/O (throttling), количества процессов.
+- **Capabilities:** разбиение привилегий root на тонкие полномочия (`CAP_NET_ADMIN`, `CAP_SYS_PTRACE`).
+- *Математическая подоплёка:* теория множеств — пространства имён как разбиение универсального множества ресурсов на непересекающиеся подмножества; cgroups как функция ограничения (constraint function) на ресурсном пространстве.
+
+**1.3. Файловые системы и Copy-on-Write**
+- Inode, dentry, VFS. Файловые системы ext4, XFS, btrfs.
+- **Copy-on-Write (COW):** механизм отложенного копирования. Почему это ключ к слоистым образам.
+- **OverlayFS:** lowerdir, upperdir, merged, workdir. Как слои накладываются друг на друга.
+- *Математическая подоплёка:* граф зависимостей слоёв как ациклический направленный граф (DAG); иммутабельность вершин и кэширование как мемоизация пути в графе.
+
+**1.4. Сетевая модель и транспорт**
+- Модель OSI и TCP/IP: инкапсуляция, уровни абстракции.
+- **TCP:** three-way handshake, скользящее окно (sliding window), контроль перегрузки (congestion control: slow start, AIMD).
+- **UDP:** stateless, быстрота, применимость для метрик и логов.
+- Сокеты, порты, NAT, DNS-резолвинг.
+- *Математическая подоплёка:* конечные автоматы для TCP (состояния ESTABLISHED, TIME_WAIT, CLOSE_WAIT); алгоритм AIMD как итеративный процесс сходимости к оптимальной скорости передачи.
+
+---
+
+## Модуль 2. Docker: анатомия контейнера и образа
+
+**2.1. Архитектура Docker и OCI**
+- Docker Engine: daemon → containerd → runc (OCI runtime). Зачем такая многоуровневость.
+- Client-server модель, UNIX-socket, REST API daemon.
+- Registry (Docker Hub), image manifest, content-addressable storage.
+- *Математическая подоплёка:* content hash как инъективное отображение $H: \text{content} \to \text{hash}$; детерминированность сборки как функциональная чистота.
+
+**2.2. Анатомия Dockerfile**
+- Инструкции: `FROM`, `RUN`, `COPY`, `ADD`, `ENV`, `ARG`, `WORKDIR`, `EXPOSE`, `CMD`, `ENTRYPOINT`.
+- Shell-форма vs Exec-форма `CMD`/`ENTRYPOINT`. Почему `ENTRYPOINT` + `CMD` — мощный паттерн.
+- Build context и `.dockerignore`: минимизация передаваемых данных.
+- **Порядок инструкций и кэширование:** почему `COPY requirements.txt` **до** `COPY .` радикально ускоряет сборку.
+- Каскадная инвалидация кэша: один изменённый слой инвалидирует все последующие.
+
+**2.3. Кэширование слоёв: механика**
+- Как Docker вычисляет хэш слоя (cache ID).
+- Immutable слои: read-only lower layers + writable container layer.
+- Стратегия упорядочивания: от частого к редкому изменению (стабильность по возрастанию).
+- BuildKit: параллельная сборка, секреты, mount-ы кэша (`--mount=type=cache`).
+
+**2.4. Многоэтапная сборка (Multi-stage builds)**
+- Проблема «толстых» образов: `gcc`, `python3-dev`, `build-essential` не нужны в рантайме.
+- Паттерн `AS builder`: компиляция C-зависимостей (`numpy`, `psycopg2`) и копирование артефактов.
+- Базовые образы: `slim`, `alpine`, `distroless`. Security vs размер vs совместимость.
+- Анализ: `dive`, `docker history`, `trivy` (security scanning).
+- **Практика:** уменьшение Python-образа для ML-инференса с 1.5 ГБ до 200 МБ.
+
+**2.5. Сети и безопасность контейнеров**
+- Bridge (default), Host, None, Overlay. User-defined bridges и DNS-резолвинг.
+- Не-root пользователь (`USER`), read-only rootfs (`--read-only`), capability dropping.
+- Seccomp, AppArmor, SELinux — мандатный контроль доступа.
+- Secrets: BuildKit secrets vs env-переменные в слоях.
+
+---
+
+## Модуль 3. Docker Compose и оркестрация мультисервисных приложений
+
+**3.1. Синтаксис и семантика `docker-compose.yml`**
+- Спецификация Compose: `services`, `networks`, `volumes`, `configs`, `secrets`.
+- `depends_on`: порядок запуска, `condition: service_healthy`, `service_started`.
+- Переменные окружения, `.env`-файлы, interpolation, profiles (`--profile`).
+- Override-файлы: `docker-compose.override.yml` для локальной разработки.
+
+**3.2. Volume-абстракции и персистентность**
+- **Bind mounts:** привязка к хосту (для разработки).
+- **Named volumes:** управляемые Docker, независимы от жизни контейнера.
+- **tmpfs:** временное хранение в RAM.
+- Драйверы volumes, backup/restore, volume plugins.
+- *Математическая подоплёка:* абстракция хранения как отображение $M: \text{virtual\_path} \to \text{physical\_resource}$; инъективность и сюръективность этого отображения.
+
+**3.3. Связка API + Брокер + БД**
+- Custom bridge network: DNS-имена по имени сервиса.
+- Healthchecks: `HEALTHCHECK` в Dockerfile или `healthcheck` в Compose.
+- Практика: поднятие стека FastAPI + PostgreSQL + Redis + Celery Worker одной командой.
+- Graceful shutdown: `SIGTERM` → drain → `SIGKILL`.
+
+**3.4. Продвинутая оркестрация**
+- Масштабирование сервисов: `docker compose up --scale worker=3`.
+- Логирование: драйверы (`json-file`, `syslog`, `fluentd`), ротация.
+- Введение в Kubernetes: Pod, Deployment, Service — зачем переходить от Compose.
+
+---
+
+## Модуль 4. Теория распределённых систем и брокеров сообщений
+
+**4.1. Парадигмы коммуникации**
+- Синхронная (RPC, REST, gRPC) vs асинхронная (message passing).
+- **Temporal coupling** (требование одновременной доступности) vs **spatial coupling** (требование знания адреса).
+- Shared memory vs message passing. Модель акторов (Hewitt) и CSP (Hoare).
+- *Математическая подоплёка:* теория коммуникационных систем, процессы как функции перехода $\delta: S \times E \to S$.
+
+**4.2. Паттерн Producer/Consumer**
+- Буфер ограниченной ёмкости (bounded buffer).
+- Семафоры Дейкстры, условные переменные.
+- Распределённый вариант: брокер как разделяемый буфер.
+- *Математическая подоплёка:* **теория массового обслуживания (queuing theory)**. Закон Литтла: $L = \lambda W$. Модели M/M/1, M/M/c. Утилизация $\rho = \lambda / (c \mu)$ и условие стабильности $\rho < 1$.
+
+**4.3. Типы брокеров и семантика сообщений**
+- **Message Queue:** точка-точка, FIFO, сообщение удаляется после обработки.
+- **Pub/Sub:** широковещание, подписчики получают копии.
+- **Event Log / Distributed Log:** неизменяемый упорядоченный лог, сообщения хранятся независимо от потребителей.
+
+**4.4. CAP-теорема и выбор системы**
+- Consistency, Availability, Partition Tolerance. Доказательство невозможности одновременного достижения всех трёх.
+- CP vs AP системы. **PACELC:** если нет разделения, то задержка (Latency) vs согласованность (Consistency).
+- *Математическая подоплёка:* формальные определения согласованности: линеаризуемость (linearizability), последовательная согласованность (sequential consistency).
+
+**4.5. Гарантии доставки**
+- **At-most-once:** fire-and-forget, возможна потеря.
+- **At-least-once:** подтверждение + retry, возможны дубликаты.
+- **Exactly-once:** идемпотентность + дедупликация (exactly-once processing, а не delivery).
+
+---
+
+## Модуль 5. Redis: от кэша к брокеру сообщений
+
+**5.1. Архитектура Redis**
+- In-memory хранилище, single-threaded event loop (epoll/kqueue).
+- Протокол RESP (REdis Serialization Protocol).
+- Персистентность: **RDB** (снапшоты, fork + COW) и **AOF** (Append-Only File, `fsync` политики).
+- Репликация: master-replica, Redis Sentinel, Redis Cluster (sharding по хеш-слотам).
+- *Математическая подоплёка:* хеш-слоты как отображение $h: \text{key} \to \{0, ..., 16383\}$; конгруэнтное хеширование для минимизации переноса данных при масштабировании.
+
+**5.2. Структуры данных для очередей**
+- **Lists:** `LPUSH`/`BRPOP` — классическая блокирующая очередь.
+- **Pub/Sub:** каналы и паттерны (`PSUBSCRIBE`). Fire-and-forget семантика, ограничения (нет персистентности, нет ACK).
+- **Streams:** эволюция от списков к логу.
+
+**5.3. Redis Streams: Append-Only Log в памяти**
+- Концепция **AOL (Append-Only Log):** неизменяемые записи, временная ориентация, сравнение с WAL в БД.
+- Команды: `XADD`, `XREAD`, `XRANGE`, `XREVRANGE`, `XLEN`, `XDEL` (пометка, не физическое удаление).
+- ID сообщений: `milliseconds-sequence`, диапазоны, автогенерация `*`.
+- **Consumer Groups:** `XGROUP CREATE`, `XREADGROUP`, `XACK`, `XPENDING`.
+- Архитектура: продюсер → stream → consumer group → консьюмеры → `XACK` → надёжная доставка.
+- *Математическая подоплёка:* лог как **моноид**: ассоциативная операция `append`, нейтральный элемент — пустой лог; частично упорядоченное множество сообщений по ID.
+
+**5.4. Практика с Redis Streams**
+- Реализация надёжной очереди задач: обработка, подтверждение, retry через `XPENDING`.
+- Сравнение с List-based очередями (Celery до Redis 5.0).
+- Backpressure: ограничение длины стрима (`MAXLEN`, `MINID`).
+
+---
+
+## Модуль 6. Celery: архитектура очередей задач
+
+**6.1. Task Queue как абстракция**
+- Задача (task) vs событие (event): семантика выполнения.
+- **Эфемерные сообщения:** сообщение живёт до обработки, затем удаляется.
+- Семантика: at-least-once execution (как минимум один раз).
+
+**6.2. Архитектура Celery**
+- Компоненты: **Producer** (приложение) → **Broker** (Redis/RabbitMQ) → **Worker** → **Result Backend**.
+- Worker pool: `prefork` (процессы), `eventlet`/`gevent` (green threads), `solo` (один поток).
+- Beat: планировщик периодических задач.
+- Сериализация: `pickle`, `json`, `msgpack`. Зачем `pickle` опасен в открытых системах.
+
+**6.3. Redis как Message Broker и Result Backend**
+- Настройка: `broker_url`, `result_backend`, `task_serializer`, `accept_content`.
+- Хранение результатов: ключи с TTL, `backend_cleanup` периодическая задача.
+- Ограничения Redis-брокера: **visibility timeout** (защита от двойной обработки), отсутствие строгого FIFO в старых версиях.
+
+**6.4. Механизм подтверждения задач (ACK/NACK)**
+- **ACK (acknowledge):** задача выполнена, сообщение можно удалить.
+- **NACK / Requeue:** вернуть задачу в очередь (например, при недоступности внешнего сервиса).
+- `acks_early` vs `acks_late`: когда задача считается выполненной — до начала или после завершения работы.
+- *Математическая подоплёка:* конечный автомат состояний задачи:  
+  $\text{PENDING} \to \text{RECEIVED} \to \text{STARTED} \to \{\text{SUCCESS}, \text{FAILURE}, \text{RETRY}\}$.
+
+**6.5. Продвинутые возможности и практика**
+- Retries: экспоненциальный backoff, jitter, `max_retries`.
+- **Canvas:** chains (`|`), groups (`group`), chords (`chord`), maps.
+- Routing: `task_routes`, отдельные очереди для CPU-bound и IO-bound задач.
+- **Практика:** вынесение ML-инференса (ONNX, 5–30 сек) из FastAPI endpoint в Celery-задачу; мониторинг через Flower.
+
+---
+
+## Модуль 7. Apache Kafka: теория распределённого лога
+
+**7.1. Философия Kafka: Distributed Commit Log**
+- Лог как центральная абстракция: неизменяемый (immutable), упорядоченный (ordered), персистентный (durable).
+- Отличие от Message Queue: pull-модель, хранение независимо от потребителей, возможность replay.
+- **Event Sourcing:** лог событий как единственный источник правды. Почему это критично для аудита ML-предсказаний.
+- *Математическая подоплёка:* лог как **последовательность** (sequence); операция append в моноиде; иммутабельность и ссылочная прозрачность (referential transparency).
+
+**7.2. Топики и партиции**
+- **Топик:** логическая категория сообщений.
+- **Партиция:** физический сегмент, единица параллелизма и упорядоченности.
+- **Ключ сообщения:** детерминированное хеширование $h(k) \mod N$ → фиксированная партиция.
+- **Репликация:** leader, follower, **ISR (In-Sync Replicas)**. Настройки `replication.factor`, `min.insync.replicas`.
+- *Математическая подоплёка:* конгруэнтное хеширование; партиции как разбиение множества сообщений на непересекающиеся подмножества с сохранением порядка внутри каждого.
+
+**7.3. Оффсеты и позиционирование**
+- **Оффсет:** монотонно возрастающий индекс внутри партиции.
+- Consumer-controlled offset: консьюмер сам решает, с какого места читать (начало, конец, конкретный offset).
+- Commit offset: синхронный (`commitSync`) vs асинхронный (`commitAsync`).
+- **Log compaction:** key-based retention (хранение последнего значения по ключу), а не time-based.
+
+**7.4. Consumer Groups и балансировка**
+- **Consumer Group:** логический консьюмер, распределяющий партиции между физическими процессами.
+- Протокол ребалансировки: assignor (`range`, `round-robin`, `sticky`, `cooperative sticky`).
+- **Partition ownership:** один консьюмер может держать несколько партиций, но одна партиция — только одному консьюмеру.
+- Heartbeat, `session.timeout.ms`, `max.poll.interval.ms`.
+- *Математическая подоплёка:* задача о назначении (assignment problem); балансировка как оптимизация дисперсии нагрузки $\min \sigma^2(\text{partitions per consumer})$.
+
+**7.5. Гарантии и семантика доставки**
+- **At-most-once:** коммит offset до обработки (риск потери).
+- **At-least-once:** коммит после обработки (риск дублирования).
+- **Exactly-once semantics (EOS):** идемпотентный продюсер (`enable.idempotence`) + транзакции (`transactional.id`) + изоляция чтения.
+- *Математическая подоплёка:* идемпотентность производителя $P(x) = P(P(x))$; транзакции как атомарные операции над множеством партиций (все или ничего).
+
+**7.6. Инфраструктура Kafka**
+- Брокеры, кластер, метаданные.
+- **ZooKeeper** vs **KRaft (Kafka Raft):** эволюция управления метаданными.
+- Controller, partition reassignment, preferred replica election.
+- Настройки надёжности: `acks=0/1/all`, `retries`, `delivery.timeout.ms`.
+
+---
+
+## Модуль 8. Практика с Kafka: aiokafka и потоковая обработка
+
+**8.1. Асинхронный клиент aiokafka**
+- `AIOKafkaProducer`: batching (`batch.size`, `linger.ms`), сжатие (`compression.type`), подтверждения (`acks`).
+- `AIOKafkaConsumer`: `subscribe`, `poll`, ручной коммит (`commit`), `seek` для replay.
+- Настройка производительности: `max_partition_fetch_bytes`, `send_buffer_bytes`.
+- **Практика:** развёртывание Kafka через Docker Compose (KRaft или ZooKeeper + брокер).
+
+**8.2. Сериализация и схемы данных**
+- JSON vs **Avro** vs **Protobuf**: производительность, размер, эволюция.
+- **Schema Registry (Confluent):** регистрация схем, версионирование.
+- Совместимость: backward, forward, full. Зачем нужна эволюция без остановки консьюмеров.
+- *Математическая подоплёка:* схема как формальная грамматика; совместимость как отношение порядка $\preceq$ на множестве схем.
+
+**8.3. Потоковая обработка**
+- Kafka Streams / Faust / Bytewax: stateful processing поверх Kafka.
+- **Оконные операции:** tumbling (фиксированное окно), sliding (перекрывающееся), session (по активности).
+- Join-ы: stream-stream, stream-table (KTable), table-table.
+- *Математическая подоплёка:* поток как бесконечная последовательность событий $\langle e_1, e_2, ... \rangle$; окно как подпоследовательность; агрегация как свёртка (fold/reduce).
+
+**8.4. Интеграция с ML**
+- Публикация фичей в real-time для online inference.
+- Потоковый inference: `aiokafka consumer` → предобработка → ONNX inference → `aiokafka producer` (feedback loop).
+- Практика: пайплайн обработки событий с гарантией at-least-once.
+
+---
+
+## Модуль 9. Масштабирование, отказоустойчивость и ребалансировка
+
+**9.1. Горизонтальное масштабирование воркеров**
+- Celery: `autoscale`, `prefetch_multiplier`, оптимальный размер пула.
+- Kafka: добавление партиций (repartitioning), добавление брокеров, добавление консьюмеров.
+- Закон Амдала и закун Густафсона: ускорение ограничено последовательной частью.
+- *Математическая подоплёка:* ускорение параллельных систем $S(n) = \frac{1}{(1-P) + P/n}$; эффективность масштабирования убывает с ростом $n$.
+
+**9.2. Ребалансировка Consumer Groups**
+- Триггеры: новый консьюмер, падение консьюмера, добавление партиции, изменение подписки.
+- **Eager rebalance:** stop-the-world, отзыв всех партиций, переназначение.
+- **Cooperative rebalancing (Kafka 2.4+):** постепенный перенос, минимизация стоп-мира.
+- Revocation и re-assignment: как избежать duplicate processing во время ребаланса.
+
+**9.3. Обработка сбоев и аномалий**
+- **Dead Letter Queue (DLQ):** изоляция poison pills (сообщений, вызывающих вечный retry).
+- **Circuit Breaker:** предотвращение каскадных отказов при недоступности внешнего сервиса.
+- Retry policies: экспоненциальный backoff с jitter для внешних API.
+- **Backpressure:** ограничение скорости потребления (`max_poll_records`, семафоры) для защиты от OOM.
+
+**9.4. Мониторинг и наблюдаемость**
+- Метрики брокеров: **consumer lag** (критичнейшая метрика), throughput, bytes in/out, request latency.
+- Инструменты: Kafka Exporter + Prometheus + Grafana; Celery Flower; Redis Insight.
+- Distributed tracing: OpenTelemetry для сквозной трассировки асинхронных сообщений.
+- Алертинг: lag-based alerts, DLQ monitoring, error rate thresholds.
+
+---
+
+## Модуль 10. Идемпотентность и консистентность в распределённых очередях
+
+**10.1. Проблема дублирования**
+- Источники: network partitions, таймауты, retries, ребалансировка, at-least-once delivery.
+- Почему exactly-once delivery невозможна в распределённой системе без trade-off'ов.
+
+**10.2. Математическое определение идемпотентности**
+- Определение: $\forall x \in D: f(f(x)) = f(x)$.
+- Идемпотентность в контексте сообщений: повторная обработка не порождает новых побочных эффектов.
+- Коммутативность и ассоциативность: когда порядок обработки не важен.
+- *Математическая подоплёка:* полугруппы и моноиды в обработке событий; **CRDT** (Conflict-free Replicated Data Types) — интуиция для state-based систем.
+
+**10.3. Стратегии реализации**
+- **Idempotency keys:** уникальный идентификатор операции (UUID, хеш), хранение в Redis/PostgreSQL с TTL.
+- **Deduplication window:** Bloom filter, HyperLogLog для приближённой дедупликации с фиксированным окном.
+- **Transactional outbox:** атомарная запись в БД и публикация события; CDC (Debezium) для чтения outbox-таблицы.
+
+**10.4. Saga Pattern и распределённые транзакции**
+- Saga: последовательность локальных транзакций с компенсирующими действиями.
+- Choreography vs Orchestration.
+- *Математическая подоплёка:* транзакции как атомарные операции; ACID в распределённой системе; теорема CAP как ограничение на строгую согласованность.
+
+**10.5. Идемпотентность в ML-конвейерах**
+- Повторная запись предсказания: `UPSERT` по `request_id`.
+- Идемпотентное обновление фичей в Feature Store.
+- **Практика:** реализация idempotency key в Celery + Redis и в aiokafka consumer.
+
+---
+
+## Модуль 11. Архитектурные отличия: очереди задач, события и логи
+
+**11.1. Эфемерные сообщения (Task Queues)**
+- Celery, RabbitMQ, Amazon SQS: сообщение существует до момента обработки.
+- Семантика: «выполни задачу». Результат — side effect или значение в Result Backend.
+- Подходит для: background jobs, email-рассылки, ML batch inference, периодические задачи.
+
+**11.2. Персистентные логи (Event Logs)**
+- Apache Kafka, Apache Pulsar: сообщение не удаляется по факту прочтения.
+- Семантика: «событие произошло». Независимость от консьюмеров.
+- **Replayability:** возможность переиграть историю с начала (time-travel, reprocessing).
+- Применение: аудит, потоковая аналитика, event sourcing, репликация состояний.
+
+**11.3. Сравнительная матрица**
+- Хранение (duration), порядок (ordering), масштабируемость (throughput), latency, гарантии доставки.
+- Когда что выбирать: короткие задачи (Celery) vs потоковая аналитика (Kafka) vs аудит и репликация (Kafka).
+
+**11.4. Гибридные архитектуры**
+- Kafka как **источник истины** (source of truth) + Celery для тяжёлой обработки.
+- Event-driven microservices: choreography (каждый сервис реагирует на события) vs orchestration (центральный оркестратор).
+- **CQRS:** разделение команд (запись в Kafka) и запросов (чтение из материализованного представления).
+
+---
+
+## Модуль 12. Интеграционный проект: End-to-end ML-пайплайн
+
+**12.1. Архитектура системы**
+- **FastAPI** (API Gateway) → **Kafka** (топик `inference.requests`) → **Celery Workers** (ML inference) → **PostgreSQL** (результаты).
+- **Redis:** кэш, брокер для Celery, хранилище idempotency keys.
+- **Docker Compose:** все сервисы с healthchecks, custom networks, named volumes.
+
+**12.2. Поток данных**
+- HTTP-запрос публикует событие в Kafka (`aiokafka` producer) с `request_id`.
+- Consumer Group читает → триггерит Celery-задачу (через `send_task`).
+- Worker выполняет ONNX inference → результат пишется в PostgreSQL (`UPSERT` по `request_id`).
+- Feedback loop: событие о завершении inference публикуется обратно в Kafka.
+
+**12.3. Требования к системе**
+- **Идемпотентность:** deduplication по `request_id` в Redis с TTL.
+- **Масштабирование:** `--scale celery-worker=4`, увеличение партиций Kafka до 4.
+- **Отказоустойчивость:** DLQ для failed tasks, retry с exponential backoff, circuit breaker для внешнего API.
+
+**12.4. Нагрузочное тестирование и отладка**
+- `locust` / `vegeta` для генерации нагрузки на API.
+- Мониторинг: consumer lag, RPS, p95/p99 latency, ошибки.
+- `docker stats`, `py-spy` для профилирования worker'ов.
+
+**12.5. Тестирование корректности и хаос-инжиниринг**
+- Проверка отсутствия потерь сообщений: счётчики вход/выход.
+- Проверка отсутствия дубликатов: уникальность `request_id` в БД.
+- **Graceful shutdown:** `docker kill -s SIGTERM`, проверка drain pending requests, коммит оффсетов.
+- **Chaos engineering:** `toxiproxy` для эмуляции network partition, `docker pause` для проверки таймаутов.
+
+---
+
+## Приложение А. Математический минимум
+
+- **Теория множеств:** отношения, функции, отображения, разбиения (для понимания namespaces, хеширования, партиций).
+- **Теория вероятностей:** матожидание, распределение Пуассона (моделирование потока сообщений), марковские процессы (очереди M/M/1).
+- **Теория графов:** ориентированные ациклические графы (DAG) для слоёв Docker и зависимостей задач.
+- **Линейная алгебра:** векторы, матрицы, скалярное произведение (для понимания embeddings в ML-конвейере).
+- **Сложность алгоритмов:** O-нотация, амортизированный анализ (для оценки операций в Redis и Kafka).
+- **Алгебра:** полугруппы, моноиды, идемпотентность (для event logs и дедупликации).
+
+## Приложение Б. Инструментарий
+
+- **Docker:** `dive` (анализ слоёв), `trivy` (сканирование), `hadolint` (lint Dockerfile), BuildKit.
+- **Kafka:** `kcat` (kafkacat), Kafka UI, AKHQ, Confluent Control Center.
+- **Redis:** `redis-cli`, RedisInsight.
+- **Celery:** Flower (мониторинг), `pytest-celery`.
+- **Разработка:** Docker Compose, Tilt, DevContainers, `toxiproxy` (хаос-инжиниринг).
+
+## Приложение В. Литература и ресурсы
+
+- **«Designing Data-Intensive Applications»** (Martin Kleppmann) — ключевая книга, главы по репликации, партицированию, очередям.
+- **«Kafka: The Definitive Guide»** (Narkhede, Shapira, Palino) — внутреннее устройство и эксплуатация.
+- **«Docker Deep Dive»** (Nigel Poulton) — механика контейнеров.
+- **«Site Reliability Engineering»** (Google) —
+- **«Site Reliability Engineering»** (Google) — надёжность, SLI/SLO, error budgets, on-call культура.  
+- **«Building Microservices»** (Sam Newman) — межсервисное взаимодействие, data ownership, deployment.  
+- **«Understanding the Linux Kernel»** (Bovet, Cesati) — namespaces, cgroups, процессы, сетевой стек.  
+- **Официальная документация:** Docker Docs, Redis Docs, Kafka Documentation, Celery Docs, aiokafka API Reference.  
+- **RFC:** RFC 6455 (WebSocket), RFC 7540 (HTTP/2), RFC 9114 (HTTP/3), AMQP 0-9-1.  
+- **Исследовательские статьи:** Leslie Lamport («Time, Clocks, and the Ordering of Events in a Distributed System»), Pat Helland («Life Beyond Distributed Transactions»).
+
+---
+
+## Принципы построения курса
+
+- **От фундамента к инструменту:** сначала механика ОС и сетей, затем Docker, затем теория распределённых систем, затем конкретные брокеры. Каждый инструмент обретает смысл только после понимания проблемы, которую он решает.
+- **Математика как интуиция, не как абстракция:** формулы вводятся там, где они дают инженерный рычаг — закон Литтла для размера очереди, CAP для выбора брокера, моноиды для понимания логов, идемпотентность для корректности.
+- **Теория + практика + поломка:** каждый модуль содержит теоретическую базу, code-along практику и задание на «сломать и починить» (chaos engineering, отладка consumer lag, анализ deadlocks в очередях).
+- **ML-специфика:** все примеры и проекты ориентированы на ML-инференс, feature pipelines, model serving — инфраструктура рассматривается не абстрактно, а как платформа для ML-продуктов.
+- **Production-first:** акцент на observability, graceful degradation, backpressure, idempotency — всё то, что отличает «работающий прототип» от «работающей системы».
+
+---
+
+**Итоговая проверка полноты:** план последовательно движется от ядра ОС (процессы, namespaces, OverlayFS) через контейнеризацию (Docker, multi-stage, Compose) к теории распределённых систем (CAP, queuing theory, Producer/Consumer), затем к конкретным системам коммуникации возрастающей сложности (Redis Streams → Celery → Kafka), завершаясь масштабированием, отказоустойчивостью, математически строгой идемпотентностью и комплексным интеграционным проектом. Все пункты вашего roadmap покрыты с фундаментальной глубиной.

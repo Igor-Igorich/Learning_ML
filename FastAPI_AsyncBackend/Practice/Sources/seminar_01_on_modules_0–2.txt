@@ -1,0 +1,1220 @@
+ Вот конспект семинара по Модулям 0-2. Он структурирован так, чтобы хорошо конвертироваться в `.ipynb` через ваш скрипт: теоретические блоки чередуются с кодовыми ячейками, а каждое задание сопровождается примером решения.
+
+---
+
+# Семинар: Модули 0-2. От синхронности к асинхронности
+
+---
+
+## Часть 0. Пролог: зачем это нужно
+
+### 0.1. Синхронный мир и его предел
+
+Когда сервер обрабатывает запрос синхронно, поток исполнения блокируется на время любой I/O-операции: чтения из базы данных, запроса к внешнему API, чтения файла с диска. Пока операция не завершится, поток ничего не делает.
+
+Ключевые понятия:
+
+- **I/O-bound задачи** — процессор ждет (сеть, диск, БД). В вебе их большинство.
+- **CPU-bound задачи** — процессор считает (ML-инференс, математика).
+- **C10K Problem** — проблема 10 000 одновременных соединений. 10 000 потоков потребляют 10-80 ГБ памяти только на стеки, а ОС тратит больше времени на переключение контекста, чем на полезную работу.
+- **GIL (Global Interpreter Lock)** — мьютекс в CPython, позволяющий только одному потоку выполнять Python-код. Многопоточность в Python эффективна только для I/O-bound задач.
+
+### 0.2. Три подхода к масштабированию
+
+| Подход | Когда применять | Проблемы |
+|---|---|---|
+| Многопоточность (threading) | I/O-bound, синхронные библиотеки | GIL мешает CPU-bound; накладные расходы на потоки |
+| Мультипроцессинг (multiprocessing) | CPU-bound (ML-инференс) | Дорогое создание процессов; сериализация через pickle |
+| Асинхронность (asyncio) | I/O-bound, тысячи соединений | CPU-bound блокирует цикл; код сложнее |
+
+### 0.3. Почему FastAPI?
+
+FastAPI стоит на трех столпах: **Starlette** (ASGI-фреймворк), **Pydantic V2** (валидация на Rust), **Python** (доступ к ML-экосистеме). Это позволяет обрабатывать тысячи I/O-операций конкурентно и при этом вызывать Python-библиотеки для ML.
+
+---
+
+## Часть 1. Фундамент Python
+
+### 1.1. Итераторы и генераторы
+
+Протокол итератора состоит из двух методов: `__iter__` возвращает объект с `__next__`, а `__next__` выдает следующий элемент или `StopIteration`. Генератор — это функция с `yield`, которая приостанавливает выполнение, сохраняя локальное состояние.
+
+```python
+# Протокол итератора: разбор for-под капотом
+data = [10, 20, 30]
+
+# Эквивалент:
+_iterator = iter(data)
+while True:
+    try:
+        element = next(_iterator)
+        print(element)
+    except StopIteration:
+        break
+```
+
+```python
+# Свой итератор: квадраты чисел
+class SquareIterator:
+    def __init__(self, start: int, end: int):
+        self.current = start
+        self.end = end
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.current > self.end:
+            raise StopIteration
+        value = self.current ** 2
+        self.current += 1
+        return value
+
+sq = SquareIterator(1, 3)
+print(list(sq))  # [1, 4, 9]
+```
+
+```python
+# Генераторная функция: то же самое, но компактнее
+def squares(start, end):
+    current = start
+    while current <= end:
+        yield current ** 2
+        current += 1
+
+print(list(squares(1, 3)))  # [1, 4, 9]
+
+# Генераторное выражение: ленивый аналог list comprehension
+squares_gen = (x**2 for x in range(1, 4))
+print(list(squares_gen))  # [1, 4, 9]
+```
+
+```python
+# yield from: делегирование другому итератору
+def sub_generator():
+    yield 1
+    yield 2
+
+def main_generator():
+    yield "start"
+    yield from sub_generator()
+    yield "end"
+
+print(list(main_generator()))  # ['start', 1, 2, 'end']
+```
+
+```python
+# Бесконечный генератор (ленивые вычисления)
+class InfiniteCounter:
+    def __init__(self, start=0):
+        self.n = start
+    def __iter__(self):
+        return self
+    def __next__(self):
+        value = self.n
+        self.n += 1
+        return value
+
+counter = InfiniteCounter()
+result = []
+for i in counter:
+    if i > 5:
+        break
+    result.append(i)
+print(result)  # [0, 1, 2, 3, 4, 5]
+```
+
+> **Ключевая связь:** `await` в `asyncio` — это синтаксический сахар над `yield from` для корутин. Генераторы учат нас: функция может приостанавливаться и возобновляться, сохраняя состояние.
+
+---
+
+### 1.2. Менеджеры контекста
+
+Протокол: `__enter__` — инициализация ресурса, `__exit__` — гарантированное освобождение. `__exit__` вызывается всегда, даже при исключении.
+
+```python
+import time
+from typing import Optional
+
+# Свой менеджер контекста: таймер
+class Timer:
+    def __enter__(self):
+        self.start = time.perf_counter()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> Optional[bool]:
+        self.elapsed = time.perf_counter() - self.start
+        print(f"Прошло {self.elapsed:.4f} секунд")
+        return None  # исключение не подавляем
+
+with Timer():
+    time.sleep(0.1)
+```
+
+```python
+from contextlib import contextmanager
+
+# Менеджер через генератор и декоратор
+@contextmanager
+def managed_resource(name):
+    print(f"Ресурс {name}: инициализация")
+    resource = {"name": name, "active": True}
+    try:
+        yield resource
+    finally:
+        resource["active"] = False
+        print(f"Ресурс {name}: освобождение")
+
+with managed_resource("database") as db:
+    print(f"Работаем с {db}")
+print(f"После выхода: active={db['active']}")
+```
+
+```python
+from contextlib import asynccontextmanager
+
+# Асинхронный менеджер контекста
+@asynccontextmanager
+async def async_managed_resource(name):
+    print(f"Async ресурс {name}: подключение")
+    # Имитация асинхронного подключения
+    conn = {"name": name, "connected": True}
+    try:
+        yield conn
+    finally:
+        conn["connected"] = False
+        print(f"Async ресурс {name}: отключение")
+
+async def demo_async_context():
+    async with async_managed_resource("postgres") as conn:
+        print(f"Работаем с {conn}")
+    print(f"После выхода: connected={conn['connected']}")
+
+# Запуск
+import asyncio
+asyncio.run(demo_async_context())
+```
+
+> **Ключевая связь:** `async with` в FastAPI используется для управления соединениями с БД, сессиями, транзакциями. `lifespan` в FastAPI — это по сути `async with` над всем приложением.
+
+---
+
+### 1.3. Типизация в Python
+
+Аннотации типов (PEP 484+) — подсказки для статического анализа. Pydantic превращает их в runtime-валидаторы.
+
+```python
+from typing import List, Dict, Optional, Union, Callable, TypeVar, Generic
+
+# Базовые типы
+def process(data: list[int]) -> dict[str, int]:
+    return {"sum": sum(data)}
+
+def find(user_id: int) -> Optional[str]:
+    return "Alice" if user_id > 0 else None
+
+def apply(func: Callable[[int], bool], items: list[int]) -> list[int]:
+    return [x for x in items if func(x)]
+
+# Generic и TypeVar
+T = TypeVar('T')
+
+class Stack(Generic[T]):
+    def __init__(self) -> None:
+        self._items: list[T] = []
+
+    def push(self, item: T) -> None:
+        self._items.append(item)
+
+    def pop(self) -> T:
+        return self._items.pop()
+
+int_stack: Stack[int] = Stack()
+int_stack.push(42)
+# int_stack.push("oops")  # mypy выдаст ошибку
+print(int_stack.pop())  # 42
+```
+
+```python
+from typing import Protocol
+
+# Protocol: структурная типизация (duck typing для статического анализа)
+class Drawable(Protocol):
+    def draw(self) -> None: ...
+
+class Circle:
+    def draw(self) -> None:
+        print("Drawing circle")
+
+class Rectangle:
+    def draw(self) -> None:
+        print("Drawing rectangle")
+
+def render(items: list[Drawable]) -> None:
+    for item in items:
+        item.draw()
+
+render([Circle(), Rectangle()])
+```
+
+```python
+from pydantic import BaseModel, Field
+
+# Pydantic: типы как runtime-контракты
+class User(BaseModel):
+    id: int
+    name: str = Field(min_length=1, max_length=100)
+    email: str
+    age: int = Field(ge=0, le=150)
+
+# Автоматическое преобразование и валидация
+user = User(id="42", name="Alice", email="alice@example.com", age=25)
+print(user.id, type(user.id))  # 42 <class 'int'>
+
+# Ошибка валидации:
+# User(id="42", name="A", email="alice@example.com", age=-5)
+```
+
+> **Вариантность типов (кратко):**
+> - **Ковариантность** (`Iterable[+T]`): только читаем. `list[Cat]` можно передать туда, где ожидается `Iterable[Animal]`.
+> - **Контравариантность** (`Callable[[-T], None]`): только пишем/принимаем. Функция, принимающая `Animal`, подходит туда, где ожидается `Callable[[Cat], None]`.
+> - **Инвариантность** (`List[T]`): и читаем, и пишем. `list[Cat]` не является `list[Animal]`.
+
+---
+
+## Часть 2. Асинхронное программирование
+
+### 2.1. Конкурентность vs Параллелизм
+
+- **Конкурентность** — задачи чередуются в одном потоке. Один повар готовит два блюда: пока вода закипает — нарезает овощи.
+- **Параллелизм** — задачи выполняются одновременно на разных ядрах. Два повара на двух плитах.
+
+`asyncio` — кооперативная многозадачность: задачи сами уступают управление в точках `await`.
+
+---
+
+### 2.2. Event Loop
+
+Event loop — бесконечный цикл, который:
+1. Берет готовые задачи из очереди.
+2. Передает им управление до ближайшего `await`.
+3. Если задач нет — засыпает, дожидаясь внешнего события (готовность сокета, таймаут).
+4. Просыпается и повторяет.
+
+```python
+import asyncio
+
+# Базовый пример: что делает asyncio.run()
+async def main():
+    print("Hello")
+    await asyncio.sleep(1)  # уступаем управление на 1 секунду
+    print("World")
+
+asyncio.run(main())
+```
+
+```python
+import asyncio
+import time
+
+# Почему time.sleep() убивает производительность
+async def bad_handler():
+    time.sleep(2)  # БЛОКИРУЕТ весь поток! Все корутины встают.
+    return "done"
+
+async def good_handler():
+    await asyncio.sleep(2)  # Уступает управление. Другие корутины работают.
+    return "done"
+
+async def demo():
+    start = time.perf_counter()
+    # Запускаем 3 "хороших" хендлера конкурентно
+    await asyncio.gather(good_handler(), good_handler(), good_handler())
+    print(f"Good: {time.perf_counter() - start:.2f}s")  # ~2s, не 6s
+
+    start = time.perf_counter()
+    # Запускаем 3 "плохих" хендлера последовательно (блокируют друг друга)
+    await asyncio.gather(bad_handler(), bad_handler(), bad_handler())
+    print(f"Bad: {time.perf_counter() - start:.2f}s")  # ~6s
+
+asyncio.run(demo())
+```
+
+---
+
+### 2.3. Корутины, Future, Task
+
+| Объект | Что это |
+|---|---|
+| **Coroutine** | `async def` функция, еще не запущенная. Черновик. |
+| **Future** | Контейнер для результата, который появится позже. Обещание. |
+| **Task** | Корутина, обернутая в задачу и поставленная в event loop. |
+
+```python
+import asyncio
+
+async def say_hello():
+    await asyncio.sleep(1)
+    return "Hello"
+
+async def demo_objects():
+    # Корутина — объект, не выполняется
+    coro = say_hello()
+    print(type(coro))  # <class 'coroutine'>
+
+    # Future — низкоуровневый примитив
+    future = asyncio.Future()
+    print(future.done())  # False
+    future.set_result(42)
+    print(future.result())  # 42
+
+    # Task — корутина в event loop
+    task = asyncio.create_task(say_hello())
+    result = await task
+    print(result)  # Hello
+
+asyncio.run(demo_objects())
+```
+
+```python
+import asyncio
+
+# Состояния задачи
+async def lifecycle_demo():
+    print("RUNNING")
+    await asyncio.sleep(0)  # уступаем, но сразу возвращаемся
+    print("BACK")
+
+async def demo_states():
+    task = asyncio.create_task(lifecycle_demo())
+    print(f"done: {task.done()}")       # False
+    print(f"cancelled: {task.cancelled()}")  # False
+
+    await task
+    print(f"done after await: {task.done()}")  # True
+    print(f"result: {task.result()}")  # None
+
+asyncio.run(demo_states())
+```
+
+---
+
+### 2.4. Параллельное выполнение корутин
+
+```python
+import asyncio
+
+async def fetch(url: str, delay: float) -> str:
+    await asyncio.sleep(delay)
+    return f"Data from {url}"
+
+# gather: конкурентный запуск, результаты в порядке аргументов
+async def demo_gather():
+    results = await asyncio.gather(
+        fetch("A", 2),
+        fetch("B", 1),
+        fetch("C", 3),
+    )
+    print(results)  # ['Data from A', 'Data from B', 'Data from C']
+
+asyncio.run(demo_gather())
+```
+
+```python
+import asyncio
+
+# gather с обработкой исключений
+async def failing_fetch(url: str) -> str:
+    await asyncio.sleep(0.5)
+    raise ValueError(f"Failed: {url}")
+
+async def demo_gather_exceptions():
+    results = await asyncio.gather(
+        fetch("A", 1),
+        failing_fetch("B"),
+        fetch("C", 2),
+        return_exceptions=True
+    )
+    print(results)
+    # ['Data from A', ValueError('Failed: B'), 'Data from C']
+
+asyncio.run(demo_gather_exceptions())
+```
+
+```python
+import asyncio
+
+# wait: тонкое управление
+async def demo_wait():
+    tasks = [
+        asyncio.create_task(fetch("A", 2)),
+        asyncio.create_task(fetch("B", 1)),
+    ]
+
+    done, pending = await asyncio.wait(
+        tasks,
+        return_when=asyncio.FIRST_COMPLETED
+    )
+    print(f"Готово: {len(done)}, В ожидании: {len(pending)}")
+
+    # Дожидаемся оставшихся
+    if pending:
+        await asyncio.wait(pending)
+
+asyncio.run(demo_wait())
+```
+
+```python
+import asyncio
+
+# as_completed: обработка по мере готовности
+async def demo_as_completed():
+    coros = [fetch(f"url_{i}", i) for i in [3, 1, 2]]
+
+    for coro in asyncio.as_completed(coros):
+        result = await coro
+        print(result)
+        # url_1 (через 1с), url_2 (через 2с), url_3 (через 3с)
+
+asyncio.run(demo_as_completed())
+```
+
+```python
+import asyncio
+
+# create_task: фоновые задачи
+async def background_worker():
+    for i in range(3):
+        print(f"Worker tick {i}")
+        await asyncio.sleep(1)
+
+async def demo_background():
+    task = asyncio.create_task(background_worker())
+
+    # Делаем что-то другое
+    await asyncio.sleep(2.5)
+    print("Main done")
+
+    # Отменяем фоновую задачу
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        print("Фоновая задача отменена")
+
+asyncio.run(demo_background())
+```
+
+```python
+import asyncio
+
+# Таймауты
+async def slow_operation():
+    await asyncio.sleep(10)
+    return "done"
+
+async def demo_timeout():
+    # Python 3.11+
+    try:
+        async with asyncio.timeout(2):
+            await slow_operation()
+    except asyncio.TimeoutError:
+        print("Таймаут!")
+
+    # До 3.11
+    try:
+        await asyncio.wait_for(slow_operation(), timeout=2.0)
+    except asyncio.TimeoutError:
+        print("Таймаут (wait_for)!")
+
+asyncio.run(demo_timeout())
+```
+
+---
+
+### 2.5. Синхронизация
+
+```python
+import asyncio
+
+# Lock: взаимное исключение
+lock = asyncio.Lock()
+shared_counter = 0
+
+async def increment():
+    global shared_counter
+    async with lock:
+        current = shared_counter
+        await asyncio.sleep(0)  # имитация "тяжелой" операции
+        shared_counter = current + 1
+
+async def demo_lock():
+    global shared_counter
+    shared_counter = 0
+    await asyncio.gather(*[increment() for _ in range(1000)])
+    print(f"Counter: {shared_counter}")  # 1000
+
+asyncio.run(demo_lock())
+```
+
+```python
+import asyncio
+
+# Semaphore: ограничение параллелизма
+semaphore = asyncio.Semaphore(3)  # не более 3 одновременно
+
+async def fetch_limited(url: str, delay: float) -> str:
+    async with semaphore:
+        print(f"  Starting {url}")
+        await asyncio.sleep(delay)
+        print(f"  Done {url}")
+        return f"Data from {url}"
+
+async def demo_semaphore():
+    urls = [f"url_{i}" for i in range(10)]
+    delays = [1.0] * 10
+    results = await asyncio.gather(*[
+        fetch_limited(u, d) for u, d in zip(urls, delays)
+    ])
+    print(f"Всего: {len(results)}")
+
+asyncio.run(demo_semaphore())
+```
+
+```python
+import asyncio
+
+# Event: сигнализация между корутинами
+event = asyncio.Event()
+
+async def waiter(name: str):
+    print(f"{name}: жду события...")
+    await event.wait()
+    print(f"{name}: событие произошло!")
+
+async def setter():
+    await asyncio.sleep(2)
+    print("Setter: выставляю событие")
+    event.set()
+
+async def demo_event():
+    await asyncio.gather(waiter("A"), waiter("B"), setter())
+
+asyncio.run(demo_event())
+```
+
+```python
+import asyncio
+
+# Condition: Event + Lock
+condition = asyncio.Condition()
+queue = []
+
+async def consumer(name: str):
+    async with condition:
+        while not queue:
+            await condition.wait()
+        item = queue.pop(0)
+        print(f"{name}: обработано {item}")
+
+async def producer():
+    await asyncio.sleep(1)
+    async with condition:
+        queue.append("data")
+        print("Producer: добавлено data")
+        condition.notify_all()
+
+async def demo_condition():
+    await asyncio.gather(
+        consumer("C1"), consumer("C2"), producer()
+    )
+
+asyncio.run(demo_condition())
+```
+
+---
+
+### 2.6. CPU-bound задачи в асинхронном коде
+
+```python
+import asyncio
+import concurrent.futures
+
+# ThreadPoolExecutor: для блокирующего I/O (освобождает event loop)
+def sync_function(x: int) -> int:
+    # Синхронная функция, которую нельзя переписать
+    return x ** 2
+
+async def demo_thread_pool():
+    loop = asyncio.get_running_loop()
+    with concurrent.futures.ThreadPoolExecutor() as pool:
+        result = await loop.run_in_executor(pool, sync_function, 42)
+        print(result)  # 1764
+
+asyncio.run(demo_thread_pool())
+```
+
+```python
+import asyncio
+import concurrent.futures
+
+# ProcessPoolExecutor: для CPU-bound задач (настоящий параллелизм)
+def cpu_intensive(n: int) -> int:
+    return sum(i * i for i in range(n))
+
+async def demo_process_pool():
+    loop = asyncio.get_running_loop()
+    with concurrent.futures.ProcessPoolExecutor() as pool:
+        result = await loop.run_in_executor(pool, cpu_intensive, 10_000_000)
+        print(f"Result: {result}")
+
+asyncio.run(demo_process_pool())
+```
+
+```python
+import asyncio
+from concurrent.futures import ProcessPoolExecutor
+
+# Паттерн "основной цикл + пул воркеров" для ML
+import numpy as np
+
+_model = None
+
+def init_worker():
+    global _model
+    # Имитация загрузки ML-модели
+    _model = lambda x: x * 2  # заглушка
+
+def predict(features: np.ndarray) -> np.ndarray:
+    return _model(features)
+
+_executor = ProcessPoolExecutor(max_workers=2, initializer=init_worker)
+
+async def predict_endpoint(features: list[float]):
+    loop = asyncio.get_running_loop()
+    arr = np.array(features)
+    result = await loop.run_in_executor(_executor, predict, arr)
+    return result.tolist()
+
+async def demo_ml_pattern():
+    result = await predict_endpoint([1.0, 2.0, 3.0])
+    print(f"Prediction: {result}")
+
+asyncio.run(demo_ml_pattern())
+```
+
+---
+
+### 2.7. Асинхронные генераторы и контекстные менеджеры
+
+```python
+import asyncio
+
+# Асинхронный генератор
+async def async_range(n: int):
+    for i in range(n):
+        await asyncio.sleep(0.1)  # имитация асинхронной работы
+        yield i
+
+async def demo_async_for():
+    async for value in async_range(5):
+        print(value, end=" ")
+    print()
+
+asyncio.run(demo_async_for())
+```
+
+```python
+from contextlib import asynccontextmanager
+
+# Асинхронный контекстный менеджер для транзакции
+@asynccontextmanager
+async def database_transaction():
+    print("BEGIN transaction")
+    try:
+        yield {"conn": "postgres"}
+    except Exception:
+        print("ROLLBACK")
+        raise
+    else:
+        print("COMMIT")
+
+async def demo_async_with():
+    async with database_transaction() as conn:
+        print(f"Executing query on {conn['conn']}")
+        # raise ValueError("oops")  # раскомментируйте для проверки rollback
+
+asyncio.run(demo_async_with())
+```
+
+```python
+import asyncio
+
+# Backpressure через asyncio.Queue
+async def producer(queue: asyncio.Queue, n: int):
+    for i in range(n):
+        await queue.put(f"item_{i}")
+        print(f"Produced: item_{i}")
+        await asyncio.sleep(0.3)
+
+async def consumer(queue: asyncio.Queue):
+    while True:
+        item = await queue.get()
+        if item is None:  # сигнал завершения
+            break
+        print(f"Consumed: {item}")
+        await asyncio.sleep(0.5)  # потребитель медленнее
+        queue.task_done()
+
+async def demo_backpressure():
+    queue = asyncio.Queue(maxsize=3)  # ограничение буфера
+    prod_task = asyncio.create_task(producer(queue, 10))
+    cons_task = asyncio.create_task(consumer(queue))
+
+    await prod_task
+    await queue.put(None)  # сигнал завершения
+    await cons_task
+
+asyncio.run(demo_backpressure())
+```
+
+---
+
+## Задания для самостоятельной работы
+
+### Задание 1. Итератор с фильтрацией
+
+Напишите класс `FilteredIterator`, который принимает iterable и функцию-предикат. Итератор должен выдавать только те элементы, для которых предикат возвращает `True`. Используйте протокол `__iter__`/`__next__`.
+
+```python
+class FilteredIterator:
+    def __init__(self, iterable, predicate):
+        self._iterator = iter(iterable)
+        self._predicate = predicate
+        self._buffer = None
+        self._has_buffer = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        while True:
+            item = next(self._iterator)
+            if self._predicate(item):
+                return item
+
+# Проверка
+data = [1, 2, 3, 4, 5, 6]
+filt = FilteredIterator(data, lambda x: x % 2 == 0)
+print(list(filt))  # [2, 4, 6]
+```
+
+---
+
+### Задание 2. Генератор Фибоначчи
+
+Напишите генераторную функцию `fibonacci(n)`, которая выдает первые `n` чисел Фибоначчи. Затем напишите генераторное выражение, которое берет только четные числа из этого генератора.
+
+```python
+def fibonacci(n: int):
+    a, b = 0, 1
+    for _ in range(n):
+        yield a
+        a, b = b, a + b
+
+# Первые 20 чисел Фибоначчи
+fib_gen = fibonacci(20)
+print(list(fib_gen))
+# [0, 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610, 987, 1597, 2584, 4181]
+
+# Только четные через генераторное выражение
+even_fib = (x for x in fibonacci(20) if x % 2 == 0)
+print(list(even_fib))
+# [0, 2, 8, 34, 144, 610, 2584]
+```
+
+---
+
+### Задание 3. Менеджер контекста для таймера с логированием
+
+Напишите менеджер контекста `TimedBlock`, который:
+- При входе запоминает время.
+- При выходе печатает, сколько прошло.
+- Если в блоке произошло исключение — печатает время и пробрасывает исключение дальше.
+
+```python
+import time
+from typing import Optional
+
+class TimedBlock:
+    def __init__(self, label: str = "Block"):
+        self.label = label
+
+    def __enter__(self):
+        self.start = time.perf_counter()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> Optional[bool]:
+        elapsed = time.perf_counter() - self.start
+        status = "OK" if exc_type is None else f"ERROR ({exc_type.__name__})"
+        print(f"[{self.label}] {status} за {elapsed:.4f}s")
+        return None  # не подавляем исключение
+
+# Проверка
+with TimedBlock("Normal"):
+    time.sleep(0.1)
+
+with TimedBlock("Failing"):
+    time.sleep(0.05)
+    raise ValueError("oops")  # исключение пробросится, но время напечатается
+```
+
+---
+
+### Задание 4. Pydantic-модель с валидацией
+
+Создайте Pydantic-модель `Product` с полями:
+- `name` (str, min_length=1)
+- `price` (float, ge=0)
+- `quantity` (int, ge=0)
+- `tags` (list[str], опционально)
+
+Продемонстрируйте автоматическое преобразование типов и валидацию.
+
+```python
+from pydantic import BaseModel, Field, ValidationError
+from typing import Optional
+
+class Product(BaseModel):
+    name: str = Field(min_length=1)
+    price: float = Field(ge=0)
+    quantity: int = Field(ge=0)
+    tags: Optional[list[str]] = None
+
+# Корректные данные с автопреобразованием
+p1 = Product(name="Laptop", price="999.99", quantity="5", tags=["electronics", "computers"])
+print(p1)
+# name='Laptop' price=999.99 quantity=5 tags=['electronics', 'computers']
+
+# Некорректные данные
+try:
+    p2 = Product(name="", price=-10, quantity=-1)
+except ValidationError as e:
+    print(e)
+```
+
+---
+
+### Задание 5. Конкурентный сбор данных
+
+Напишите функцию `fetch_all(urls)`, которая конкурентно "загружает" данные из списка URL. Используйте `asyncio.gather`. Каждый URL "загружается" через `asyncio.sleep(random.uniform(0.5, 2.0))`. Верните результаты в том же порядке, в каком переданы URL.
+
+```python
+import asyncio
+import random
+
+async def fetch(url: str) -> str:
+    delay = random.uniform(0.5, 2.0)
+    await asyncio.sleep(delay)
+    return f"Data from {url} (delay={delay:.2f}s)"
+
+async def fetch_all(urls: list[str]) -> list[str]:
+    tasks = [fetch(url) for url in urls]
+    return await asyncio.gather(*tasks)
+
+async def main():
+    urls = ["https://api.a.com", "https://api.b.com", "https://api.c.com"]
+    results = await fetch_all(urls)
+    for r in results:
+        print(r)
+
+asyncio.run(main())
+```
+
+---
+
+### Задание 6. Ограничение параллелизма через Semaphore
+
+Модифицируйте `fetch_all` из задания 5: добавьте `asyncio.Semaphore(2)`, чтобы одновременно выполнялось не более 2 запросов. Добавьте `print` при старте и завершении каждого запроса, чтобы было видно ограничение.
+
+```python
+import asyncio
+import random
+
+semaphore = asyncio.Semaphore(2)
+
+async def fetch_limited(url: str) -> str:
+    async with semaphore:
+        print(f"  START {url}")
+        delay = random.uniform(0.5, 2.0)
+        await asyncio.sleep(delay)
+        print(f"  DONE  {url}")
+        return f"Data from {url}"
+
+async def fetch_all_limited(urls: list[str]) -> list[str]:
+    tasks = [fetch_limited(url) for url in urls]
+    return await asyncio.gather(*tasks)
+
+async def main():
+    urls = [f"https://api.{c}.com" for c in "abcde"]
+    results = await fetch_all_limited(urls)
+    print(f"\nВсего загружено: {len(results)}")
+
+asyncio.run(main())
+```
+
+---
+
+### Задание 7. Отмена задачи с корректной очисткой
+
+Напишите корутину `worker()`, которая в цикле каждую секунду печатает "tick". Запустите её как фоновую задачу. Через 3.5 секунды отмените задачу. Убедитесь, что корутина корректно обрабатывает отмену (делает cleanup) и пробрасывает `CancelledError`.
+
+```python
+import asyncio
+
+async def worker():
+    try:
+        i = 0
+        while True:
+            print(f"tick {i}")
+            await asyncio.sleep(1)
+            i += 1
+    except asyncio.CancelledError:
+        print("Cleanup: закрываем ресурсы...")
+        raise  # обязательно пробрасываем!
+
+async def main():
+    task = asyncio.create_task(worker())
+    await asyncio.sleep(3.5)
+    print("Main: отменяем worker")
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        print("Main: worker успешно отменен")
+
+asyncio.run(main())
+```
+
+---
+
+### Задание 8. Таймаут с обработкой
+
+Напишите функцию `fetch_with_timeout(url, timeout)`, которая "загружает" URL через `asyncio.sleep(5)` (имитация медленного сервера). Если загрузка занимает больше `timeout` секунд — должна выброситься `TimeoutError`, а не ждать вечно. Используйте `asyncio.timeout` (3.11+) или `asyncio.wait_for`.
+
+```python
+import asyncio
+
+async def slow_fetch(url: str) -> str:
+    await asyncio.sleep(5)  # медленный сервер
+    return f"Data from {url}"
+
+async def fetch_with_timeout(url: str, timeout: float) -> str:
+    async with asyncio.timeout(timeout):
+        return await slow_fetch(url)
+
+async def main():
+    try:
+        result = await fetch_with_timeout("https://slow.api.com", timeout=2.0)
+        print(result)
+    except asyncio.TimeoutError:
+        print("Таймаут! Сервер не ответил за 2 секунды")
+
+asyncio.run(main())
+```
+
+---
+
+### Задание 9. Race condition и его устранение
+
+Напишите две версии `increment_counter(n)`: одну без `asyncio.Lock` и одну с `asyncio.Lock`. Запустите 1000 корутин, каждая из которых инкрементирует глобальный счетчик. Сравните результаты.
+
+```python
+import asyncio
+
+# Версия БЕЗ lock (race condition)
+counter_no_lock = 0
+
+async def increment_no_lock():
+    global counter_no_lock
+    current = counter_no_lock
+    await asyncio.sleep(0)  # точка уступки — здесь происходит интерливинг
+    counter_no_lock = current + 1
+
+# Версия С lock
+counter_with_lock = 0
+lock = asyncio.Lock()
+
+async def increment_with_lock():
+    global counter_with_lock
+    async with lock:
+        current = counter_with_lock
+        await asyncio.sleep(0)
+        counter_with_lock = current + 1
+
+async def main():
+    # Без lock
+    global counter_no_lock, counter_with_lock
+    counter_no_lock = 0
+    await asyncio.gather(*[increment_no_lock() for _ in range(1000)])
+    print(f"Без lock: {counter_no_lock} (ожидалось 1000)")
+
+    # С lock
+    counter_with_lock = 0
+    await asyncio.gather(*[increment_with_lock() for _ in range(1000)])
+    print(f"С lock: {counter_with_lock} (ожидалось 1000)")
+
+asyncio.run(main())
+```
+
+---
+
+### Задание 10. CPU-bound задача в ProcessPoolExecutor
+
+Напишите функцию `is_prime(n)`, которая проверяет, является ли число простым (наивный алгоритм). Запустите проверку для списка чисел `[10**6 + i for i in range(20)]` двумя способами:
+1. Синхронно в цикле (замерьте время).
+2. Через `ProcessPoolExecutor` с конкурентным выполнением (замерьте время).
+
+```python
+import asyncio
+import concurrent.futures
+import time
+
+def is_prime(n: int) -> bool:
+    if n < 2:
+        return False
+    if n == 2:
+        return True
+    if n % 2 == 0:
+        return False
+    for i in range(3, int(n**0.5) + 1, 2):
+        if n % i == 0:
+            return False
+    return True
+
+def sync_check(numbers: list[int]) -> list[bool]:
+    return [is_prime(n) for n in numbers]
+
+async def async_check(numbers: list[int]) -> list[bool]:
+    loop = asyncio.get_running_loop()
+    with concurrent.futures.ProcessPoolExecutor() as pool:
+        futures = [loop.run_in_executor(pool, is_prime, n) for n in numbers]
+        return await asyncio.gather(*futures)
+
+async def main():
+    numbers = [10**6 + i for i in range(20)]
+
+    # Синхронно
+    start = time.perf_counter()
+    sync_results = sync_check(numbers)
+    sync_time = time.perf_counter() - start
+    print(f"Синхронно: {sync_time:.3f}s")
+
+    # Через ProcessPool
+    start = time.perf_counter()
+    async_results = await async_check(numbers)
+    async_time = time.perf_counter() - start
+    print(f"ProcessPool: {async_time:.3f}s")
+
+    print(f"Результаты совпадают: {sync_results == async_results}")
+
+asyncio.run(main())
+```
+
+---
+
+### Задание 11. Асинхронный генератор для постраничной загрузки
+
+Напишите асинхронный генератор `fetch_pages(base_url, max_pages)`, который "загружает" страницы данных. Каждая страница загружается через `asyncio.sleep(0.2)` и возвращает список из 5 элементов. Генератор останавливается, когда страница пуста или достигнут `max_pages`.
+
+```python
+import asyncio
+
+async def fetch_pages(base_url: str, max_pages: int = 10):
+    for page in range(1, max_pages + 1):
+        await asyncio.sleep(0.2)  # имитация сетевого запроса
+        # Имитация: страницы 1-3 содержат данные, страница 4+ — пустые
+        if page > 3:
+            break
+        data = [f"{base_url}/page{page}/item{i}" for i in range(5)]
+        yield data
+
+async def main():
+    async for page_data in fetch_pages("https://api.example.com", max_pages=5):
+        print(f"Page: {page_data}")
+
+asyncio.run(main())
+```
+
+---
+
+### Задание 12. Асинхронный контекстный менеджер с rollback
+
+Напишите `asynccontextmanager` `transaction`, который:
+- При входе печатает "BEGIN".
+- При нормальном выходе печатает "COMMIT".
+- При исключении печатает "ROLLBACK" и пробрасывает исключение.
+
+```python
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def transaction(tx_id: str):
+    print(f"[{tx_id}] BEGIN")
+    try:
+        yield tx_id
+    except Exception as e:
+        print(f"[{tx_id}] ROLLBACK: {e}")
+        raise
+    else:
+        print(f"[{tx_id}] COMMIT")
+
+async def main():
+    # Успешная транзакция
+    async with transaction("T1") as tx:
+        print(f"  Working in {tx}")
+
+    # Неуспешная транзакция
+    try:
+        async with transaction("T2") as tx:
+            print(f"  Working in {tx}")
+            raise ValueError("Something went wrong")
+    except ValueError:
+        print("  Exception caught outside")
+
+asyncio.run(main())
+```
+
+---
+
+## Итоговая сводка
+
+| Концепция | Модуль | Ключевой API / Паттерн |
+|---|---|---|
+| Синхронность vs Асинхронность | 0 | I/O-bound vs CPU-bound, C10K |
+| GIL | 0 | threading бесполезен для CPU-bound |
+| Протокол итератора | 1 | `__iter__`, `__next__`, `StopIteration` |
+| Генераторы | 1 | `yield`, `yield from`, генераторные выражения |
+| Менеджеры контекста | 1 | `__enter__`/`__exit__`, `@contextmanager` |
+| Типизация | 1 | `Generic`, `TypeVar`, `Protocol`, Pydantic |
+| Event Loop | 2 | `asyncio.run()`, `get_running_loop()` |
+| Корутины | 2 | `async def`, `await` |
+| Task / Future | 2 | `create_task()`, `asyncio.Future` |
+| Конкурентный запуск | 2 | `gather()`, `wait()`, `as_completed()` |
+| Синхронизация | 2 | `Lock`, `Semaphore`, `Event`, `Condition` |
+| Отмена и таймауты | 2 | `task.cancel()`, `asyncio.timeout()` |
+| CPU-bound в async | 2 | `run_in_executor()` + `ProcessPoolExecutor` |
+| Асинхронные генераторы | 2 | `async for`, `__aiter__`, `__anext__` |
+| Асинхронные контексты | 2 | `async with`, `@asynccontextmanager` |
+
+---
+
+## Чек-лист для самопроверки
+
+- [ ] Я могу объяснить, почему `time.sleep()` в `async def` блокирует весь сервер.
+- [ ] Я понимаю разницу между `Coroutine`, `Task` и `Future`.
+- [ ] Я умею использовать `asyncio.gather` для конкурентного выполнения.
+- [ ] Я знаю, когда нужен `Lock`, а когда — `Semaphore`.
+- [ ] Я умею отменять задачи и обрабатывать `CancelledError` корректно.
+- [ ] Я понимаю, куда девать CPU-bound код в асинхронном приложении.
+- [ ] Я могу написать `async for` и `async with` с нуля.

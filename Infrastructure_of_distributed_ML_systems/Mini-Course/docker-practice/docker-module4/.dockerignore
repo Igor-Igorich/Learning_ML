@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+env/
+ENV/
+.ENV
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Логи и временные файлы
+*.log
+logs/
+tmp/
+*.tmp
+
+# Тесты и документация (если не нужны в продакшене)
+tests/
+test/
+*.md
+!README.md	# Исключение из правила: README.md не игнорировать
+
+# Данные (если они монтируются через volume, а не копируются)
+data/
+datasets/
+
+# Docker
+Dockerfile*
+.dockerignore
+
+# Системные файлы
+.DS_Store
+Thumbs.db
