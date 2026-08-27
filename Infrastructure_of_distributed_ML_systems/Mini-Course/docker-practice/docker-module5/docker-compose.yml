@@ -1,0 +1,35 @@
+services:
+  db:
+    image: porstgres:15-alpine
+    container_name: shop_db
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: secret123
+      POSTGRES_DB: shop
+    volumes:
+      - pd_data:var/lib/postgresgl/data
+  
+  redis:
+    image: redis:7-alpine
+    container_name: shop_redis
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+  
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: shop_api
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://admin:secret123@db:5432/shop
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      - db
+      - redis
+
+volumes:
+  pd_data:
+  redis_data:
