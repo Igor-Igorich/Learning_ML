@@ -1,0 +1,19 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  producer:
+    build: .
+    depends_on:
+      - redis
+    command: python stream_producer.py
+
+  consumer:
+    build: .
+    depends_on:
+      - redis
+    command: python stream_consumer_group.py docker_consumer
+    deploy:
+      replicas: 2  # Два воркера
