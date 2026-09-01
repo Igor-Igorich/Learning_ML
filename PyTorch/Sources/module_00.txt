@@ -1,0 +1,567 @@
+# День 0. Подготовка среды — подробный конспект
+
+---
+
+## 1. Что такое PyTorch и зачем он нужен
+
+### 1.1. Контекст: где PyTorch стоит в экосистеме ML
+
+В мире машинного обучения есть два больших лагеря **фреймворков для глубокого обучения** (Deep Learning):
+
+| Фреймворк | Кто использует | Особенности |
+|:---|:---|:---|
+| **PyTorch** | Исследователи, стартапы, большинство академических статей | Императивный стиль (код выполняется строка за строкой, как обычный Python). Легко отлаживать. |
+| **TensorFlow** | Google, production-системы, мобильные устройства | Декларативный стиль (сначала строится граф вычислений, потом он выполняется). Сложнее в отладке. |
+| **JAX** | Исследователи, продвинутые пользователи | Функциональный стиль, автоматическое векторное распараллеливание. Крут, но сложен для входа. |
+
+**Для тебя важно:** PyTorch — это **де-факто стандарт** для обучения нейросетей в 2025–2026 годах. Если на собеседовании спросят «покажите нейросеть», ожидают именно PyTorch. TensorFlow сейчас встречается в legacy-коде, но новые проекты почти всегда на PyTorch.
+
+### 1.2. Что делает PyTorch
+
+PyTorch — это **библиотека для работы с многомерными массивами (тензорами) с автоматическим дифференцированием**. Разложим по полочкам:
+
+- **Тензоры** = многомерные массивы чисел (как `numpy.ndarray`, но с суперспособностями).
+- **Автоматическое дифференцирование** = PyTorch сам считает градиенты функции потерь по всем параметрам модели. Тебе не нужно выводить формулы градиентов вручную.
+- **GPU-ускорение** = PyTorch умеет переносить вычисления на видеокарту (NVIDIA CUDA, Apple MPS, AMD ROCm), что ускоряет обучение нейросетей в десятки-сотни раз.
+
+### 1.3. Почему PyTorch, а не NumPy?
+
+| Возможность | NumPy | PyTorch |
+|:---|:---|:---|
+| Многомерные массивы | Да | Да |
+| GPU-вычисления | Нет | Да |
+| Автоматическое дифференцирование (градиенты) | Нет | Да |
+| Нейросетевые слои (Linear, Conv2d и т.д.) | Нет | Да (модуль `nn`) |
+| Оптимизаторы (Adam, SGD) | Нет | Да (модуль `optim`) |
+| Загрузка данных (батчинг, шаффл) | Нет | Да (модуль `data`) |
+
+**Вывод:** NumPy — это фундаментальная библиотека для численных вычислений на CPU. PyTorch — это **NumPy + GPU + autograd + нейросети + оптимизаторы + загрузка данных**. Поэтому в DL используют PyTorch, а NumPy — для предобработки данных и как «тренировочную площадку» перед PyTorch.
+
+---
+
+## 2. Установка PyTorch
+
+### 2.1. Способы установки
+
+Есть два основных способа:
+
+**Способ A: `pip` (рекомендуется для простоты)**
+```bash
+pip install torch torchvision torchaudio
+```
+
+**Способ B: `conda` / `mamba` (если используешь Anaconda/Miniconda)**
+```bash
+conda install pytorch torchvision torchaudio -c pytorch
+```
+
+### 2.2. Критически важно: версия PyTorch и CUDA
+
+**CUDA** — это платформа NVIDIA для параллельных вычислений на GPU. Если у тебя видеокарта NVIDIA, PyTorch может использовать её для ускорения.
+
+**Проблема:** PyTorch поставляется в двух вариантах:
+- **CPU-only** — работает только на процессоре, не требует видеокарты.
+- **CUDA-версия** — работает и на CPU, и на GPU NVIDIA.
+
+**Как узнать, какую версию ставить:**
+
+1. **Есть ли у тебя видеокарта NVIDIA?**
+   - Windows: открой Диспетчер устройств → Видеоадаптеры. Если видишь «NVIDIA GeForce ...» или «NVIDIA RTX ...» — у тебя NVIDIA.
+   - Linux: `lspci | grep -i nvidia`
+   - macOS: у Mac нет NVIDIA-видеокарт (кроме очень старых моделей). На Mac с чипом M1/M2/M3 используется **MPS** (Metal Performance Shaders) вместо CUDA.
+
+2. **Какая версия CUDA драйвера установлена?**
+   - Windows/Linux: `nvidia-smi` в терминале. Выведет что-то вроде:
+     ```
+     NVIDIA-SMI 545.23.08              Driver Version: 545.23.08    CUDA Version: 12.3
+     ```
+     Важно число после «CUDA Version» — это **максимальная** версия CUDA, которую поддерживает твой драйвер.
+
+3. **Какую версию PyTorch ставить:**
+   - Иди на [pytorch.org](https://pytorch.org/get-started/locally/) — там есть конструктор команды установки.
+   - Выбираешь: OS → Package (pip/conda) → Language (Python) → Compute Platform (CPU / CUDA 11.8 / CUDA 12.1 / CUDA 12.4 / ROCm).
+   - **Правило:** бери CUDA-версию PyTorch, которая **не выше** версии CUDA твоего драйвера. Например, если драйвер поддерживает CUDA 12.3, ставь PyTorch с CUDA 12.1. Если драйвер CUDA 11.8 — ставь PyTorch с CUDA 11.8.
+
+### 2.3. Пошаговая установка (примеры)
+
+**Сценарий 1: Есть NVIDIA GPU, драйвер CUDA 12.x**
+```bash
+# PyTorch 2.4+ с поддержкой CUDA 12.1
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+```
+
+**Сценарий 2: Есть NVIDIA GPU, драйвер CUDA 11.8**
+```bash
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+```
+
+**Сценарий 3: Нет GPU (или не NVIDIA)**
+```bash
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+```
+
+**Сценарий 4: Mac с чипом M1/M2/M3**
+```bash
+pip install torch torchvision torchaudio
+```
+(На Mac PyTorch автоматически включает поддержку MPS, если macOS ≥ 12.3)
+
+### 2.4. Проверка установки
+
+После установки открой Python-интерпретатор:
+```bash
+python
+```
+
+И выполни:
+```python
+import torch
+print(torch.__version__)           # Должно вывести версию, например '2.4.0+cu121'
+print(torch.cuda.is_available())   # True — если GPU доступна, False — если нет
+```
+
+**Если `torch.cuda.is_available()` возвращает `False`, хотя GPU есть:**
+- Возможно, ты установил CPU-версию PyTorch. Переустанови с правильным `--index-url`.
+- Возможно, драйвер NVIDIA не установлен или устарел. Обнови драйвер с [nvidia.com](https://www.nvidia.com/Download/index.aspx).
+- Возможно, ты на WSL2 (Windows Subsystem for Linux) — там нужен специальный драйвер. См. [документацию PyTorch для WSL](https://pytorch.org/blog/getting-started-with-pytorch-on-wsl/).
+
+---
+
+## 3. Структура экосистемы PyTorch
+
+PyTorch — это не одна библиотека, а **экосистема** модулей. Вот что ты будешь использовать:
+
+| Модуль | Что внутри | Когда используешь |
+|:---|:---|:---|
+| `torch` | Ядро: тензоры, математические операции, autograd | Всегда |
+| `torch.nn` | Нейросетевые слои: Linear, Conv2d, ReLU, Dropout, Loss-функции | При построении моделей |
+| `torch.optim` | Оптимизаторы: SGD, Adam, AdamW, RMSprop | При обучении |
+| `torch.utils.data` | Dataset, DataLoader, Sampler | При загрузке данных |
+| `torchvision` | Датасеты с картинками (MNIST, CIFAR), трансформации, предобученные модели | При работе с изображениями |
+| `torchaudio` | Датасеты с аудио, спектрограммы | При работе со звуком |
+| `torchtext` | Датасеты с текстом, токенизация | При работе с NLP (устаревает, сейчас чаще используют HuggingFace) |
+
+**Для нашего курса** понадобятся: `torch`, `torch.nn`, `torch.optim`, `torch.utils.data`. `torchvision` — опционально (для загрузки готовых датасетов).
+
+---
+
+## 4. Первый тензор — теория
+
+### 4.1. Что такое тензор
+
+**Тензор** — это обобщение понятий:
+- **0-мерный тензор** = скаляр (одно число)
+- **1-мерный тензор** = вектор (строка или столбец чисел)
+- **2-мерный тензор** = матрица (таблица чисел)
+- **3+ мерный тензор** = многомерный массив
+
+В PyTorch тензор — это объект класса `torch.Tensor`, который хранит:
+1. **Данные** (сами числа)
+2. **Тип данных** (`dtype`: `float32`, `float64`, `int32`, `int64` и т.д.)
+3. **Устройство** (`device`: `cpu` или `cuda:0` или `mps`)
+4. **Флаг отслеживания градиентов** (`requires_grad`: `True` или `False`)
+
+### 4.2. Создание тензора
+
+```python
+import torch
+
+# Скаляр (0-мерный)
+scalar = torch.tensor(42)
+print(scalar)          # tensor(42)
+print(scalar.shape)    # torch.Size([]) — пустой размер
+print(scalar.ndim)     # 0 — ноль измерений
+
+# Вектор (1-мерный)
+vector = torch.tensor([1.0, 2.0, 3.0])
+print(vector.shape)    # torch.Size([3]) — 3 элемента
+print(vector.ndim)     # 1 — одно измерение
+
+# Матрица (2-мерная)
+matrix = torch.tensor([[1, 2, 3],
+                       [4, 5, 6]])
+print(matrix.shape)    # torch.Size([2, 3]) — 2 строки, 3 столбца
+print(matrix.ndim)     # 2 — два измерения
+
+# 3-мерный тензор (например, батч из 2 картинок размером 3x3)
+tensor_3d = torch.tensor([[[1, 2, 3],
+                           [4, 5, 6],
+                           [7, 8, 9]],
+                          [[10, 11, 12],
+                           [13, 14, 15],
+                           [16, 17, 18]]])
+print(tensor_3d.shape)  # torch.Size([2, 3, 3])
+print(tensor_3d.ndim)   # 3
+```
+
+**Важное правило чтения `.shape`:** читаем справа налево (от «внутреннего» к «внешнему»):
+- `torch.Size([2, 3, 3])` = 2 объекта, каждый из которых — матрица 3×3.
+- В контексте картинок: `[batch_size, height, width]` или `[batch_size, channels, height, width]`.
+
+### 4.3. Специальные конструкторы тензоров
+
+```python
+import torch
+
+# Нули
+zeros = torch.zeros(2, 3)           # матрица 2×3 из нулей
+print(zeros)
+# tensor([[0., 0., 0.],
+#         [0., 0., 0.]])
+
+# Единицы
+ones = torch.ones(3, 3)             # матрица 3×3 из единиц
+
+# Случайные числа из равномерного распределения [0, 1)
+rand = torch.rand(2, 3)             # матрица 2×3, каждый элемент — случайное число от 0 до 1
+
+# Случайные числа из нормального распределения N(0, 1)
+randn = torch.randn(2, 3)           # матрица 2×3, каждый элемент ~ N(0, 1)
+
+# Арифметическая прогрессия
+arange = torch.arange(0, 10, 2)     # tensor([0, 2, 4, 6, 8]) — от 0 до 10 (не включая) с шагом 2
+
+# Равномерное разбиение интервала
+linspace = torch.linspace(0, 1, 5)  # tensor([0.0000, 0.2500, 0.5000, 0.7500, 1.0000])
+
+# Пустой тензор (неинициализированная память — мусор!)
+empty = torch.empty(2, 3)           # быстрее zeros, но значения случайные! Используй только если сразу перезапишешь.
+
+# Тензор как копия существующего
+a = torch.tensor([1, 2, 3])
+b = torch.zeros_like(a)             # tensor([0, 0, 0]) — той же формы и типа, что a
+c = torch.ones_like(a)              # tensor([1, 1, 1])
+```
+
+### 4.4. Типы данных (`dtype`)
+
+PyTorch строго типизирован. Каждый тензор имеет тип:
+
+| Тип | PyTorch | Аналог NumPy | Когда используется |
+|:---|:---|:---|:---|
+| 32-бит float | `torch.float32` или `torch.float` | `np.float32` | **Стандарт для нейросетей**. Почти все модели используют float32. |
+| 64-бит float | `torch.float64` или `torch.double` | `np.float64` | Для высокой точности (редко в DL). |
+| 16-бит float | `torch.float16` | `np.float16` | Для экономии памяти на GPU (mixed precision training). |
+| 64-бит integer | `torch.int64` или `torch.long` | `np.int64` | Для индексов, меток классов. |
+| 32-бит integer | `torch.int32` или `torch.int` | `np.int32` | Для счётчиков, индексов. |
+| 8-бит integer | `torch.int8` | `np.int8` | Для компактного хранения (квантизация). |
+| Boolean | `torch.bool` | `np.bool_` | Для масок. |
+
+**Почему float32, а не float64?**
+- float64 занимает в 2 раза больше памяти.
+- GPU вычисляют float32 в 2–4 раза быстрее, чем float64.
+- Точности float32 хватает для 99.9% задач DL.
+- **Важно:** по умолчанию `torch.tensor([1.0, 2.0])` создаёт float32. Но `torch.tensor([1, 2])` создаёт int64!
+
+```python
+a = torch.tensor([1.0, 2.0])
+print(a.dtype)  # torch.float32
+
+b = torch.tensor([1, 2])
+print(b.dtype)  # torch.int64
+
+# Явное указание типа
+c = torch.tensor([1, 2], dtype=torch.float32)
+print(c.dtype)  # torch.float32
+
+# Смена типа
+d = b.float()   # int64 → float32
+e = a.double()  # float32 → float64
+f = a.long()    # float32 → int64 (округляет вниз!)
+```
+
+### 4.5. Устройство (`device`)
+
+```python
+import torch
+
+# Узнать, есть ли GPU
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(device)  # cuda (если есть GPU) или cpu
+
+# Создать тензор на конкретном устройстве
+cpu_tensor = torch.tensor([1.0, 2.0], device='cpu')
+gpu_tensor = torch.tensor([1.0, 2.0], device='cuda')   # только если GPU есть!
+
+# Перенести тензор на другое устройство
+tensor = torch.tensor([1.0, 2.0])
+tensor_on_gpu = tensor.to('cuda')   # или tensor.cuda()
+tensor_back = tensor_on_gpu.to('cpu')  # или tensor_on_gpu.cpu()
+
+# Проверить, где лежит тензор
+print(tensor.device)  # cpu
+```
+
+**Критически важное правило:** все тензоры в одной операции должны быть на **одном устройстве**. Иначе:
+```python
+a = torch.tensor([1.0, 2.0])          # на CPU
+b = torch.tensor([3.0, 4.0], device='cuda')  # на GPU
+c = a + b  # RuntimeError: Expected all tensors to be on the same device!
+```
+
+### 4.6. Флаг `requires_grad`
+
+Этот флаг включает отслеживание операций для автоматического дифференцирования (autograd). Пока что просто запомни:
+
+```python
+x = torch.tensor([2.0, 3.0], requires_grad=True)
+print(x.requires_grad)  # True
+
+y = torch.tensor([2.0, 3.0])  # по умолчанию False
+print(y.requires_grad)  # False
+```
+
+В Дне 2 мы разберём, что именно происходит, когда `requires_grad=True`.
+
+---
+
+## 5. Практика: скрипт `check_env.py`
+
+Создай файл `check_env.py` и запусти его. Этот скрипт — твоя «приветственная проверка».
+
+```python
+"""
+check_env.py
+Проверка окружения PyTorch перед началом курса.
+"""
+
+import torch
+import sys
+
+
+def check_environment():
+    print("=" * 60)
+    print("ПРОВЕРКА ОКРУЖЕНИЯ PYTORCH")
+    print("=" * 60)
+    
+    # 1. Версия Python
+    print(f"\n[1] Версия Python: {sys.version}")
+    
+    # 2. Версия PyTorch
+    print(f"\n[2] Версия PyTorch: {torch.__version__}")
+    
+    # 3. Доступность CUDA
+    cuda_available = torch.cuda.is_available()
+    print(f"\n[3] CUDA доступна: {cuda_available}")
+    
+    if cuda_available:
+        # Имя GPU
+        gpu_name = torch.cuda.get_device_name(0)
+        print(f"    Имя GPU: {gpu_name}")
+        
+        # Количество GPU
+        gpu_count = torch.cuda.device_count()
+        print(f"    Количество GPU: {gpu_count}")
+        
+        # Версия CUDA (runtime)
+        cuda_version = torch.version.cuda
+        print(f"    Версия CUDA (runtime): {cuda_version}")
+        
+        # Текущее устройство
+        current_device = torch.cuda.current_device()
+        print(f"    Текущее устройство: cuda:{current_device}")
+        
+        # Память GPU
+        memory_allocated = torch.cuda.memory_allocated(0) / 1024**2
+        memory_reserved = torch.cuda.memory_reserved(0) / 1024**2
+        print(f"    Память (allocated): {memory_allocated:.2f} MB")
+        print(f"    Память (reserved):  {memory_reserved:.2f} MB")
+    else:
+        print("    GPU не обнаружена. Будем работать на CPU.")
+        print("    Это нормально — весь курс можно пройти на CPU.")
+    
+    # 4. Создание тестового тензора
+    print(f"\n[4] Тестовый тензор:")
+    
+    # Определяем устройство для теста
+    device = torch.device('cuda' if cuda_available else 'cpu')
+    print(f"    Устройство для теста: {device}")
+    
+    # Создаём тензор 3×3 со случайными числами
+    test_tensor = torch.randn(3, 3, device=device)
+    print(f"    Форма: {test_tensor.shape}")
+    print(f"    Тип данных: {test_tensor.dtype}")
+    print(f"    Устройство: {test_tensor.device}")
+    print(f"    Содержимое:\n{test_tensor}")
+    
+    # 5. Простая операция
+    print(f"\n[5] Тестовая операция (умножение матриц):")
+    a = torch.randn(2, 3, device=device)
+    b = torch.randn(3, 4, device=device)
+    c = torch.matmul(a, b)
+    print(f"    A: {a.shape}, B: {b.shape} → C: {c.shape}")
+    print(f"    Результат:\n{c}")
+    
+    # 6. Проверка torchvision (опционально)
+    try:
+        import torchvision
+        print(f"\n[6] Torchvision: {torchvision.__version__}")
+    except ImportError:
+        print(f"\n[6] Torchvision: НЕ установлен (не критично для курса)")
+    
+    print("\n" + "=" * 60)
+    print("ПРОВЕРКА ЗАВЕРШЕНА УСПЕШНО")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    check_environment()
+```
+
+**Ожидаемый вывод (с GPU):**
+```
+============================================================
+ПРОВЕРКА ОКРУЖЕНИЯ PYTORCH
+============================================================
+
+[1] Версия Python: 3.11.9 ...
+
+[2] Версия PyTorch: 2.4.0+cu121
+
+[3] CUDA доступна: True
+    Имя GPU: NVIDIA GeForce RTX 3060
+    Количество GPU: 1
+    Версия CUDA (runtime): 12.1
+    Текущее устройство: cuda:0
+    Память (allocated): 0.00 MB
+    Память (reserved):  0.00 MB
+
+[4] Тестовый тензор:
+    Устройство для теста: cuda
+    Форма: torch.Size([3, 3])
+    Тип данных: torch.float32
+    Устройство: cuda:0
+    Содержимое:
+    tensor([[ 0.1234, -0.5678,  0.9012],
+            [-0.3456,  0.7890, -0.1234],
+            [ 0.5678, -0.9012,  0.3456]], device='cuda:0')
+
+[5] Тестовая операция (умножение матриц):
+    A: torch.Size([2, 3]), B: torch.Size([3, 4]) → C: torch.Size([2, 4])
+    Результат:
+    tensor([[...]], device='cuda:0')
+
+[6] Torchvision: 0.19.0+cu121
+
+============================================================
+ПРОВЕРКА ЗАВЕРШЕНА УСПЕШНО
+============================================================
+```
+
+**Ожидаемый вывод (без GPU):**
+```
+[3] CUDA доступна: False
+    GPU не обнаружена. Будем работать на CPU.
+    Это нормально — весь курс можно пройти на CPU.
+```
+
+---
+
+## 6. Настройка рабочей среды
+
+### 6.1. Jupyter Notebook / JupyterLab
+
+Jupyter — интерактивная среда, где код выполняется по ячейкам. Идеально для экспериментов.
+
+```bash
+pip install jupyter jupyterlab
+```
+
+Запуск:
+```bash
+jupyter notebook      # классический интерфейс
+jupyter lab           # современный интерфейс (рекомендуется)
+```
+
+**Важно для GPU:** в Jupyter тоже нужно проверять `torch.cuda.is_available()`. Иногда Jupyter запускается из другого окружения, и PyTorch там — CPU-версия.
+
+### 6.2. VS Code + Jupyter Extension
+
+Рекомендуемый вариант для серьёзной работы:
+
+1. Установи **VS Code**.
+2. Установи расширение **Python** (Microsoft).
+3. Установи расширение **Jupyter** (Microsoft).
+4. Создай файл `.ipynb` — VS Code откроет его как Jupyter-ноутбук.
+5. Выбери Python-интерпретатор (Ctrl+Shift+P → «Python: Select Interpreter») — тот, в который установлен PyTorch.
+
+**Проверка в VS Code:**
+Создай ячейку и выполни:
+```python
+import torch
+torch.cuda.is_available()
+```
+Должно вернуть `True` (если GPU есть).
+
+### 6.3. Структура папок для курса
+
+Создай структуру:
+```
+pytorch-course/
+├── day0/
+│   ├── check_env.py
+│   └── notes.ipynb
+├── day1/
+│   └── ...
+├── day2/
+│   └── ...
+...
+```
+
+---
+
+## 7. Типичные проблемы и их решения
+
+### Проблема 1: `ModuleNotFoundError: No module named 'torch'`
+**Причина:** PyTorch установлен в другое окружение Python.  
+**Решение:** Убедись, что `python` и `pip` из одного окружения:
+```bash
+which python      # Linux/Mac
+where python      # Windows
+python -m pip install torch
+```
+
+### Проблема 2: `torch.cuda.is_available()` возвращает `False`
+**Причины и решения:**
+- Установлена CPU-версия → переустанови с правильным `--index-url`.
+- Нет NVIDIA GPU → нормально, работай на CPU.
+- Драйвер NVIDIA не установлен → установи с [nvidia.com](https://www.nvidia.com/Download/index.aspx).
+- На Linux: `nvidia-smi` не найден → установи драйвер NVIDIA.
+
+### Проблема 3: `RuntimeError: CUDA error: out of memory`
+**Причина:** GPU не хватает памяти.  
+**Решение:** Уменьши размер модели/батча или работай на CPU. На этом этапе курса такой ошибки быть не должно — мы пока не создаём больших моделей.
+
+### Проблема 4: `AssertionError: Torch not compiled with CUDA enabled`
+**Причина:** Ты пытаешься использовать CUDA, но установлена CPU-версия PyTorch.  
+**Решение:** Переустанови PyTorch с CUDA-индексом.
+
+### Проблема 5: Mac M1/M2 — `torch.cuda.is_available()` всегда `False`
+**Причина:** На Mac нет CUDA. Вместо него используется **MPS** (Metal Performance Shaders).  
+**Проверка MPS:**
+```python
+print(torch.backends.mps.is_available())  # True на Mac M1/M2/M3
+device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
+```
+
+---
+
+## 8. Итоги Дня 0
+
+**Что ты должен уметь после этого дня:**
+
+1. ✅ Объяснить, чем PyTorch отличается от NumPy и зачем он нужен.
+2. ✅ Установить PyTorch правильной версии (CPU или CUDA).
+3. ✅ Проверить доступность GPU через `torch.cuda.is_available()`.
+4. ✅ Создать тензоры разных форм и типов (`torch.tensor`, `torch.zeros`, `torch.randn`).
+5. ✅ Прочитать `.shape`, `.dtype`, `.device`, `.ndim` у любого тензора.
+6. ✅ Перенести тензор на GPU и обратно (`.to()`, `.cuda()`, `.cpu()`).
+7. ✅ Запустить `check_env.py` и получить успешный вывод.
+8. ✅ Настроить Jupyter / VS Code для работы с PyTorch.
+
+**Главное правило на весь курс:** перед любой операцией проверяй `.device` и `.dtype` у тензоров. 80% ошибок новичков — это mismatch по устройству или типу данных.
+
+**Переходи к Дню 1, когда:**
+- `check_env.py` выводит версию PyTorch без ошибок.
+- Ты можешь создать тензор на GPU (или на CPU, если GPU нет) и выполнить с ним операции.
+- Ты понимаешь разницу между `torch.float32` и `torch.int64`.
