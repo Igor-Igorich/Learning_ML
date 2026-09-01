@@ -1,0 +1,758 @@
+ # День 2. Autograd — автоматическое дифференцирование
+
+---
+
+## 1. Введение: зачем нужен autograd
+
+### 1.1. Проблема ручного вычисления градиентов
+
+В Дне 1 ты написал линейную регрессию и **сам** вывел формулы градиентов:
+
+```python
+grad_w = (2.0 / N) * (diff * X).sum()
+grad_b = (2.0 / N) * diff.sum()
+```
+
+Для линейной регрессии (2 параметра) это просто. Но представь нейросеть:
+
+```
+Input (784) → Linear(784→256) → ReLU → Linear(256→128) → ReLU → Linear(128→10) → Softmax
+```
+
+**Сколько производных нужно посчитать вручную?**
+- Веса первого слоя: 784 × 256 = **200 704** параметров.
+- Каждый из них участвует в цепочке операций: линейное преобразование → ReLU → линейное → ReLU → линейное → softmax → loss.
+- Для каждого параметра нужно применить **chain rule** (правило дифференцирования сложной функции) через 5+ слоёв.
+
+Это **невозможно** делать вручную без ошибок. И даже если выведешь формулы — оптимизировать их под GPU, кэшировать промежуточные значения, обрабатывать ветвления в графе — это месяцы работы.
+
+### 1.2. Что такое autograd
+
+**Autograd** (automatic gradients) — это подсистема PyTorch, которая **автоматически** вычисляет градиенты любой дифференцируемой функции, заданной через операции с тензорами.
+
+Ключевые свойства:
+- **Reverse-mode automatic differentiation** — вычисляет градиенты в обратном направлении (от loss к параметрам).
+- **Dynamic computational graph** — граф строится «на лету», при выполнении кода. Не нужно заранее декларировать архитектуру.
+- **Точность** — градиенты точные (не численные приближения), потому что вычисляются аналитически для каждой операции.
+
+**Аналогия:** представь, что ты решаешь задачу в несколько действий. Autograd — это тетрадь, в которой автоматически записывается каждый шаг. Когда ты говоришь «а теперь найди, как итоговый ответ зависит от первого числа», autograd листает тетрадь с конца и применяет правила дифференцирования к каждому шагу.
+
+---
+
+## 2. Математическая основа: правило цепочки (Chain Rule)
+
+Прежде чем разбирать PyTorch, убедимся, что математика понятна.
+
+### 2.1. Одномерный случай
+
+Если `z = f(y)` и `y = g(x)`, то:
+
+```
+dz/dx = dz/dy · dy/dx
+```
+
+**Пример:**
+```
+z = y²,    y = 2x + 3
+dz/dy = 2y
+dy/dx = 2
+dz/dx = 2y · 2 = 2(2x+3) · 2 = 4(2x+3)
+```
+
+Проверим при `x = 1`:
+- Прямой проход: `y = 5`, `z = 25`
+- Градиент: `dz/dx = 4·5 = 20`
+
+### 2.2. Многомерный случай (векторный)
+
+Если `z = f(y₁, y₂, ..., yₙ)` и каждый `yᵢ = gᵢ(x)`, то:
+
+```
+∂z/∂x = Σ (∂z/∂yᵢ · ∂yᵢ/∂x)
+```
+
+В матричной форме (для нейросетей): градиент loss по весам — это произведение якобианов слоёв.
+
+### 2.3. Как это работает в нейросети
+
+```
+x → [Linear] → h1 → [ReLU] → h2 → [Linear] → h3 → [Loss] → L
+```
+
+**Forward pass (прямой проход):**
+- Считаем `h1`, `h2`, `h3`, `L` по порядку.
+- Сохраняем промежуточные значения (они понадобятся для градиентов).
+
+**Backward pass (обратный проход):**
+- Начинаем с `∂L/∂L = 1`
+- `∂L/∂h3 = ∂L/∂L · ∂L/∂h3`
+- `∂L/∂h2 = ∂L/∂h3 · ∂h3/∂h2`
+- `∂L/∂h1 = ∂L/∂h2 · ∂h2/∂h1`
+- `∂L/∂W₁ = ∂L/∂h1 · ∂h1/∂W₁`
+
+**Ключевой инсайт:** градиент «текёт» от конца к началу, умножаясь на локальные производные на каждом шаге. Это и есть **backpropagation** (обратное распространение ошибки).
+
+---
+
+## 3. Computational Graph в PyTorch
+
+### 3.1. Что такое вычислительный граф
+
+Когда ты выполняешь операции с тензорами, у которых `requires_grad=True`, PyTorch незаметно строит **граф вычислений**:
+
+- **Узлы (nodes)** = тензоры.
+- **Рёбра (edges)** = операции (`+`, `*`, `matmul`, `sin`, и т.д.).
+- **Листовые узлы (leaf nodes)** = тензоры, созданные пользователем (параметры модели).
+- **Внутренние узлы** = результаты операций.
+
+### 3.2. Пример простого графа
+
+```python
+import torch
+
+x = torch.tensor(2.0, requires_grad=True)   # leaf node
+y = torch.tensor(3.0, requires_grad=True)   # leaf node
+
+# Строим граф:
+a = x + 2          # внутренний узел, grad_fn = AddBackward0
+b = a * y          # внутренний узел, grad_fn = MulBackward0
+c = b ** 2         # внутренний узел, grad_fn = PowBackward0
+
+print(x.is_leaf)   # True
+print(a.is_leaf)   # False (результат операции)
+print(a.grad_fn)   # <AddBackward0 object at 0x...>
+print(b.grad_fn)   # <MulBackward0 object at 0x...>
+print(c.grad_fn)   # <PowBackward0 object at 0x...>
+```
+
+**Визуализация графа:**
+
+```
+x(2.0) ──┐
+         ├──[+]──→ a(4.0) ──┐
+y(3.0) ──┘                  ├──[*]──→ b(12.0) ──[**2]──→ c(144.0)
+                              ↑
+                            y(3.0) также входит в умножение
+```
+
+### 3.3. grad_fn — «память» об операции
+
+`grad_fn` — это объект, который знает:
+1. **Какую операцию** выполнял (`Add`, `Mul`, `Pow`, `MatMul`, ...).
+2. **Какие тензоры** были входами (через `next_functions`).
+3. **Как вычислить градиент** по входам, зная градиент по выходу.
+
+```python
+# Заглянем под капот
+print(c.grad_fn)                    # PowBackward0
+print(c.grad_fn.next_functions)     # кортеж ссылок на предыдущие grad_fn
+
+# Можно пройти по графу назад
+print(c.grad_fn.next_functions[0][0])  # MulBackward0 (потому что c = b**2, а b = a*y)
+print(c.grad_fn.next_functions[0][0].next_functions)  # AddBackward0 и ...
+```
+
+**Зачем это нужно знать:** когда ты вызываешь `.backward()`, PyTorch проходит по этому графу от `c` к `x` и `y`, вызывая `grad_fn` каждого узла.
+
+---
+
+## 4. requires_grad=True — включаем отслеживание
+
+### 4.1. Как создать тензор с отслеживанием
+
+```python
+# Способ 1: явно при создании
+w = torch.tensor(2.0, requires_grad=True)
+
+# Способ 2: позже
+x = torch.tensor(3.0)
+x.requires_grad_(True)   # in-place!
+
+# Способ 3: для весов модели (будет в Дне 3)
+# nn.Parameter(torch.randn(3, 3)) — автоматически requires_grad=True
+```
+
+### 4.2. Что происходит под капотом
+
+Когда `requires_grad=True`:
+1. PyTorch создаёт **grad_fn** для каждой операции, в которой участвует этот тензор.
+2. Сохраняет **промежуточные значения** (например, входы в ReLU, выходы линейных слоёв) — они нужны для вычисления градиентов.
+3. Для **leaf-тензоров** выделяет буфер `.grad`, куда будет записан градиент.
+
+**Память:** каждая операция сохраняет свои входы. Поэтому граф обучения занимает больше памяти, чем просто forward-pass.
+
+### 4.3. Leaf vs non-leaf тензоры
+
+```python
+w = torch.tensor(2.0, requires_grad=True)   # leaf — создан пользователем
+b = torch.tensor(1.0, requires_grad=True)   # leaf
+
+y = w * 3 + b                               # non-leaf — результат операции
+
+print(w.is_leaf)   # True
+print(y.is_leaf)   # False
+
+# Только leaf-тензоры получают .grad после backward
+# y.grad будет None, даже если y.requires_grad=True
+```
+
+**Почему так:** PyTorch оптимизирует память. Градиенты нужны только для параметров (leaf), которые мы будем обновлять. Промежуточные градиенты (для `y`) выбрасываются после использования.
+
+---
+
+## 5. .backward() — запуск обратного прохода
+
+### 5.1. Базовый пример со скаляром
+
+```python
+x = torch.tensor(3.0, requires_grad=True)
+
+y = x ** 2          # y = 9
+print(y)            # tensor(9., grad_fn=<PowBackward0>)
+
+y.backward()        # запускаем backprop
+
+print(x.grad)       # tensor(6.)
+# dy/dx = 2*x = 2*3 = 6 ✓
+```
+
+**Что произошло:**
+1. `y.backward()` сказал PyTorch: «начни с `∂y/∂y = 1` и распространи градиенты к leaf-тензорам».
+2. `PowBackward0` знает: если `y = x²`, то `∂y/∂x = 2x`.
+3. `2 * 3 = 6` → записал в `x.grad`.
+
+### 5.2. Векторный случай: зачем нужен аргумент gradient
+
+Если твоя функция возвращает **вектор** (не скаляр), `.backward()` не знает, по какому направлению считать градиент. Нужно явно указать.
+
+```python
+x = torch.tensor([1.0, 2.0, 3.0], requires_grad=True)
+
+y = x ** 2          # y = [1, 4, 9] — ВЕКТОР
+
+# ОШИБКА:
+# y.backward()
+# RuntimeError: grad can be implicitly created only for scalar outputs
+
+# НУЖНО указать вектор-мультипликатор:
+v = torch.tensor([1.0, 1.0, 1.0])
+y.backward(gradient=v)
+print(x.grad)       # tensor([2., 4., 6.]) = [2*1, 2*2, 2*3]
+
+# Если v = [1, 0, 0], получим градиент только для первого элемента
+```
+
+**Математика:** для векторной функции `y = f(x)` вызов `y.backward(v)` вычисляет `J^T · v`, где `J` — якобиан. Если `y` — скаляр, `v` не нужен (по умолчанию `v = 1`).
+
+**В нейросетях loss ВСЕГДА скаляр** (одно число — средняя ошибка по батчу). Поэтому в 99% случаев ты пишешь просто `loss.backward()`.
+
+### 5.3. Несколько входов
+
+```python
+x = torch.tensor(2.0, requires_grad=True)
+y = torch.tensor(3.0, requires_grad=True)
+
+z = x**2 + y**3     # z = 4 + 27 = 31
+
+z.backward()
+
+print(x.grad)       # dz/dx = 2*x = 4
+print(y.grad)       # dz/dy = 3*y^2 = 27
+```
+
+---
+
+## 6. .grad — аккумуляция градиентов
+
+### 6.1. Градиенты СУММИРУЮТСЯ
+
+Это **самая частая ошибка** новичков в PyTorch.
+
+```python
+x = torch.tensor(2.0, requires_grad=True)
+
+for i in range(3):
+    y = x ** 2
+    y.backward()
+    print(f"Итерация {i+1}: x.grad = {x.grad}")
+
+# Вывод:
+# Итерация 1: x.grad = 4.0      (2*2 = 4)
+# Итерация 2: x.grad = 8.0      (4 + 4 = 8!)
+# Итерация 3: x.grad = 12.0     (8 + 4 = 12!)
+```
+
+**Почему так:** PyTorch предполагает, что ты можешь считать loss по частям (например, для нескольких выходов модели) и хочешь сложить градиенты. Поэтому `.backward()` **прибавляет** градиент к существующему `.grad`, а не перезаписывает.
+
+### 6.2. .zero_grad() — обнуление перед backward
+
+```python
+x = torch.tensor(2.0, requires_grad=True)
+
+for i in range(3):
+    if x.grad is not None:
+        x.grad.zero_()      # ОБНУЛЯЕМ перед новым backward!
+    
+    y = x ** 2
+    y.backward()
+    print(f"Итерация {i+1}: x.grad = {x.grad}")
+
+# Вывод:
+# Итерация 1: x.grad = 4.0
+# Итерация 2: x.grad = 4.0
+# Итерация 3: x.grad = 4.0
+```
+
+**Практическое правило:** перед каждым `loss.backward()` вызывай `optimizer.zero_grad()` (или `model.zero_grad()`, или обнуляй вручную). Иначе градиенты накапливаются и веса «убегают».
+
+---
+
+## 7. Практика: линейная регрессия с autograd
+
+Теперь перепишем код Дня 1, но **градиенты считает PyTorch**.
+
+### 7.1. Полный код
+
+```python
+"""
+day2_linear_regression_autograd.py
+Линейная регрессия с автоматическим дифференцированием.
+Сравни с day1 — здесь нет ручных формул градиентов!
+"""
+
+import torch
+import matplotlib.pyplot as plt
+
+# ============================================
+# 1. Генерация данных (то же, что в Дне 1)
+# ============================================
+
+torch.manual_seed(42)
+
+N = 100
+X = torch.linspace(0, 10, N)
+true_w = 2.0
+true_b = 1.0
+noise = torch.randn(N) * 0.5
+Y = true_w * X + true_b + noise
+
+# ============================================
+# 2. Параметры модели — теперь с requires_grad!
+# ============================================
+
+# Начальные значения — случайные
+w = torch.randn(1, requires_grad=True)   # [1] — вектор из 1 элемента
+b = torch.randn(1, requires_grad=True)
+
+print(f"Начальные: w={w.item():.4f}, b={b.item():.4f}")
+
+# ============================================
+# 3. Гиперпараметры
+# ============================================
+
+learning_rate = 0.01
+n_epochs = 1000
+
+loss_history = []
+
+# ============================================
+# 4. Цикл обучения
+# ============================================
+
+for epoch in range(n_epochs):
+    # --- Forward pass ---
+    Y_pred = w * X + b          # broadcasting: w[1] * X[100] → [100]
+    loss = ((Y_pred - Y) ** 2).mean()
+    loss_history.append(loss.item())
+    
+    # --- Backward pass (ВСЯ МАГИЯ ЗДЕСЬ) ---
+    loss.backward()
+    
+    # --- Обновление весов ---
+    # ВАЖНО: обновляем веса БЕЗ отслеживания градиентов!
+    # Иначе PyTorch построит граф для операции "w = w - lr * grad" 
+    # и будет пытаться дифференцировать шаг градиентного спуска
+    with torch.no_grad():
+        w -= learning_rate * w.grad
+        b -= learning_rate * b.grad
+    
+    # --- Обнуление градиентов ---
+    w.grad.zero_()
+    b.grad.zero_()
+    
+    # --- Логирование ---
+    if (epoch + 1) % 100 == 0:
+        print(f"Эпоха {epoch+1:4d}: loss={loss.item():.6f}, w={w.item():.4f}, b={b.item():.4f}")
+
+# ============================================
+# 5. Результаты
+# ============================================
+
+print(f"\n{'='*50}")
+print(f"Истинные:  w={true_w:.4f}, b={true_b:.4f}")
+print(f"Найденные: w={w.item():.4f}, b={b.item():.4f}")
+print(f"{'='*50}")
+
+# ============================================
+# 6. Визуализация
+# ============================================
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+ax1 = axes[0]
+ax1.scatter(X.detach().numpy(), Y.detach().numpy(), alpha=0.5, label='Данные')
+ax1.plot(X.numpy(), (true_w * X + true_b).numpy(), 'g--', label='Истинная линия')
+ax1.plot(X.numpy(), (w * X + b).detach().numpy(), 'r-', linewidth=2, label='Предсказание')
+ax1.set_xlabel('x')
+ax1.set_ylabel('y')
+ax1.set_title('Линейная регрессия с autograd')
+ax1.legend()
+ax1.grid(True)
+
+ax2 = axes[1]
+ax2.plot(loss_history)
+ax2.set_xlabel('Эпоха')
+ax2.set_ylabel('MSE Loss')
+ax2.set_title('Кривая обучения')
+ax2.set_yscale('log')
+ax2.grid(True)
+
+plt.tight_layout()
+plt.savefig('day2_linear_regression_autograd.png', dpi=150)
+plt.show()
+```
+
+### 7.2. Разбор ключевых отличий от Дня 1
+
+| Аспект | День 1 (ручно) | День 2 (autograd) |
+|:---|:---|:---|
+| Градиенты | Считали формулами | `loss.backward()` |
+| `requires_grad` | `False` | `True` |
+| Обновление весов | `w = w - lr * grad_w` | `with torch.no_grad(): w -= lr * w.grad` |
+| Обнуление градиентов | Не нужно (пересоздавали вручную) | `w.grad.zero_()` — обязательно! |
+
+### 7.3. Зачем `with torch.no_grad()` при обновлении весов
+
+```python
+# Плохо (без torch.no_grad()):
+w = w - learning_rate * w.grad
+```
+
+**Что произойдёт:** операция `w - lr * w.grad` создаст новый тензор в графе вычислений. На следующей итерации `loss.backward()` попытается пройти через этот граф и может либо:
+1. Считать «градиент градиента» (вторую производную) — что медленно и ненужно.
+2. Вызвать ошибку, если ты изменишь `w` in-place.
+
+```python
+# Хорошо (с torch.no_grad()):
+with torch.no_grad():
+    w -= learning_rate * w.grad
+```
+
+**Что происходит:** внутри блока `torch.no_grad()` PyTorch **не строит вычислительный граф**. Операция выполняется «вхолостую», быстро и без побочных эффектов.
+
+### 7.4. Проверка: градиенты совпадают с ручными?
+
+```python
+# После первой итерации из Дня 2:
+print(w.grad)   # tensor([-18.2345]) — примерное значение
+
+# В Дне 1 для тех же начальных w, b:
+# grad_w = (2/N) * sum((y_pred - y) * x)
+# Вычисли вручную — числа должны совпадать с точностью до float32!
+```
+
+---
+
+## 8. torch.no_grad() — инференс без графа
+
+### 8.1. Зачем нужен
+
+При **инференсе** (предсказании на новых данных) нам не нужны градиенты. Граф вычислений занимает память и замедляет код.
+
+```python
+model = ...  # обученная модель
+x_test = torch.randn(100, 784)
+
+# Плохо: строит граф, который никогда не используется
+y_pred = model(x_test)
+
+# Хорошо: быстро, без графа
+with torch.no_grad():
+    y_pred = model(x_test)
+```
+
+### 8.2. Два способа использования
+
+```python
+# Способ 1: контекстный менеджер (рекомендуется)
+with torch.no_grad():
+    predictions = model(x)
+    loss = criterion(predictions, y)
+    # loss.backward()  # ОШИБКА! внутри no_grad нельзя вызвать backward
+
+# Способ 2: декоратор для функций
+@torch.no_grad()
+def predict(model, x):
+    return model(x)
+
+# Способ 3: глобальное отключение (опасно, не рекомендуется)
+torch.set_grad_enabled(False)
+```
+
+### 8.3. Практика: считаем метрики на валидации
+
+```python
+# Внутри цикла обучения:
+with torch.no_grad():
+    val_pred = w * X_val + b
+    val_loss = ((val_pred - Y_val) ** 2).mean()
+    print(f"Val loss: {val_loss.item():.4f}")
+    # val_loss.backward()  # ← ОШИБКА! нельзя в no_grad
+```
+
+---
+
+## 9. .detach() — «отрыв» от графа
+
+### 9.1. Что делает
+
+`.detach()` возвращает **новый тензор** с теми же данными, но:
+- `requires_grad = False`
+- `grad_fn = None`
+- Не отслеживается в графе
+
+```python
+x = torch.tensor(2.0, requires_grad=True)
+y = x ** 2
+
+y_detached = y.detach()
+print(y_detached.requires_grad)   # False
+print(y_detached.grad_fn)         # None
+```
+
+### 9.2. Когда использовать
+
+**Случай 1: передача в NumPy**
+```python
+loss = ((y_pred - y) ** 2).mean()
+# loss.numpy()  # ОШИБКА: can't call numpy() on Tensor that requires grad
+loss_np = loss.detach().numpy()   # OK
+```
+
+**Случай 2: логирование значений**
+```python
+loss_history.append(loss.detach().item())  # .item() тоже работает, но detach — явнее
+```
+
+**Случай 3: копирование данных без графа**
+```python
+best_weights = model.state_dict()  # автоматически detached
+# или
+best_w = w.detach().clone()
+```
+
+**Случай 4: использование предсказаний вне модели**
+```python
+with torch.no_grad():
+    pred = model(x)
+# pred уже detached (потому что создавался в no_grad)
+```
+
+### 9.3. Разница .detach() vs torch.no_grad()
+
+| | `.detach()` | `torch.no_grad()` |
+|:---|:---|:---|
+| Что делает | Отрывает ОДИН тензор от графа | Отключает граф для ВСЕХ операций в блоке |
+| Когда использовать | Нужно «вытащить» значение из графа | Инференс, валидация, обновление весов |
+| Можно ли потом вызвать backward? | Нет ( detached) | Нет (граф не построен) |
+
+---
+
+## 10. retain_graph=True — множественный backward
+
+### 10.1. Проблема
+
+По умолчанию `.backward()` **освобождает граф** после использования. Это экономит память.
+
+```python
+x = torch.tensor(2.0, requires_grad=True)
+y = x ** 2
+
+y.backward()
+print(x.grad)       # 4.0
+
+y.backward()        # RuntimeError: Trying to backward through the graph a second time...
+```
+
+### 10.2. Решение: retain_graph=True
+
+```python
+x = torch.tensor(2.0, requires_grad=True)
+y = x ** 2
+
+y.backward(retain_graph=True)
+print(x.grad)       # 4.0
+
+x.grad.zero_()
+y.backward()        # OK! Граф сохранён
+print(x.grad)       # 4.0
+```
+
+### 10.3. Когда нужно в реальности
+
+**Множественные loss'ы:**
+```python
+# Два выхода модели: classification + regression
+pred_class = model_class(x)
+pred_value = model_value(x)
+
+loss_class = criterion_class(pred_class, y_class)
+loss_value = criterion_value(pred_value, y_value)
+
+# Сначала backward по первому loss, сохраняя граф
+loss_class.backward(retain_graph=True)
+
+# Потом по второму
+loss_value.backward()
+
+# Или суммарный:
+total_loss = loss_class + loss_value
+total_loss.backward()  # здесь retain_graph не нужен — один backward
+```
+
+**Внимание:** `retain_graph=True` держит граф в памяти. Если граф большой (ResNet, Transformer), это может привести к **Out of Memory**. Используй только когда действительно нужно.
+
+---
+
+## 11. Просмотр графа: grad_fn и next_functions
+
+### 11.1. Исследуем граф вручную
+
+```python
+x = torch.tensor(2.0, requires_grad=True)
+y = torch.tensor(3.0, requires_grad=True)
+
+a = x + 2
+b = a * y
+c = b ** 2
+
+print("=== Граф от c к параметрам ===")
+print(f"c.grad_fn = {c.grad_fn}")
+print(f"c.grad_fn.next_functions = {c.grad_fn.next_functions}")
+
+# Разберём next_functions:
+# c = b**2 → grad_fn = PowBackward0
+# next_functions[0] = (MulBackward0, 0) — потому что c = (a*y)**2, вход = b = a*y
+print(f"\n--- Уровень 1: PowBackward0 ---")
+pow_fn = c.grad_fn
+print(f"  next_functions[0]: {pow_fn.next_functions[0][0]}")
+
+# Уровень 2: MulBackward0
+print(f"\n--- Уровень 2: MulBackward0 ---")
+mul_fn = pow_fn.next_functions[0][0]
+print(f"  next_functions: {mul_fn.next_functions}")
+# next_functions[0] = (AddBackward0, 0) — a = x + 2
+# next_functions[1] = (AccumulateGrad, 0) — y (leaf tensor!)
+
+# Уровень 3: AddBackward0
+print(f"\n--- Уровень 3: AddBackward0 ---")
+add_fn = mul_fn.next_functions[0][0]
+print(f"  next_functions: {add_fn.next_functions}")
+# next_functions[0] = (AccumulateGrad, 0) — x (leaf tensor!)
+# next_functions[1] = None — константа 2, градиент не нужен
+```
+
+**AccumulateGrad** — специальный grad_fn для leaf-тензоров. Он не вычисляет новый градиент, а **суммирует** его в `.grad`.
+
+### 11.2. Визуализация графа
+
+```
+c = (a*y)²
+│
+└── PowBackward0
+    │
+    └── MulBackward0 (b = a*y)
+        │
+        ├── AddBackward0 (a = x+2)
+        │   │
+        │   ├── AccumulateGrad → x.grad
+        │   └── None (константа 2)
+        │
+        └── AccumulateGrad → y.grad
+```
+
+---
+
+## 12. Типичные ошибки и их решения
+
+### Ошибка 1: `RuntimeError: Trying to backward through the graph a second time`
+
+**Причина:** вызвал `.backward()` дважды на одном и том же графе без `retain_graph=True`.  
+**Решение:** либо `retain_graph=True`, либо обнуляй граф (обычно нужно второе).
+
+### Ошибка 2: `RuntimeError: a leaf Variable that requires grad is being used in an in-place operation`
+
+**Причина:** попытка изменить leaf-тензор in-place (например, `w += 1` вместо `w = w + 1`).  
+**Почему:** PyTorch отслеживает версию тензора для корректности градиентов. In-place ломает эту версионность.  
+**Решение:** используй `with torch.no_grad(): w -= lr * w.grad` или `w.data -= lr * w.grad`.
+
+### Ошибка 3: Градиенты растут (взрываются) или обнуляются
+
+**Причина:** скорее всего, забыл `.zero_grad()`. Градиенты накапливаются.  
+**Диагностика:** напечатай `w.grad.norm()` перед обновлением. Если растёт — забыл обнулить.
+
+### Ошибка 4: `RuntimeError: element 0 of tensors does not require grad and does not have a grad_fn`
+
+**Причина:** пытаешься вызвать `.backward()` на тензоре, который не участвовал в графе (создан с `requires_grad=False`).  
+**Решение:** убедись, что входные параметры имеют `requires_grad=True`.
+
+### Ошибка 5: `RuntimeError: grad can be implicitly created only for scalar outputs`
+
+**Причина:** `.backward()` на векторе/матрице без аргумента `gradient`.  
+**Решение:** либо усредни до скаляра (`loss.mean()`), либо передай `gradient` вектор.
+
+### Ошибка 6: `AttributeError: 'NoneType' object has no attribute 'zero_'`
+
+**Причина:** пытаешься вызвать `.grad.zero_()`, но `.grad` ещё `None` (backward ещё не вызывался).  
+**Решение:** проверяй `if w.grad is not None:` перед обнулением.
+
+---
+
+## 13. Чек-лист навыков Дня 2
+
+| Навык | Проверь себя |
+|:---|:---|
+| Объяснить, что такое computational graph | ☐ |
+| Создать тензор с `requires_grad=True` и увидеть `grad_fn` у результата | ☐ |
+| Вычислить градиент через `.backward()` для скаляра | ☐ |
+| Объяснить, почему для вектора нужен аргумент `gradient` | ☐ |
+| Обнулить градиенты через `.zero_grad()` | ☐ |
+| Объяснить, почему градиенты аккумулируются | ☐ |
+| Обновить веса внутри `torch.no_grad()` | ☐ |
+| Объяснить разницу между `torch.no_grad()` и `.detach()` | ☐ |
+| Использовать `retain_graph=True` когда нужно | ☐ |
+| Пройти по графу через `.grad_fn.next_functions` | ☐ |
+| Переписать линейную регрессию Дня 1 с autograd | ☐ |
+| Объяснить, почему in-place операции на leaf-тензорах запрещены | ☐ |
+
+---
+
+## 14. Итоги Дня 2
+
+**Что ты теперь знаешь:**
+
+1. **Autograd** — это reverse-mode automatic differentiation. PyTorch строит граф операций и проходит его в обратном направлении, вычисляя градиенты по chain rule.
+2. **`requires_grad=True`** включает отслеживание. Результаты операций получают `grad_fn`.
+3. **`.backward()`** запускает backprop от скаляра к leaf-тензорам. Для векторов нужен аргумент `gradient`.
+4. **`.grad` аккумулирует** градиенты. Перед каждым backward нужен `.zero_grad()`.
+5. **`torch.no_grad()`** отключает построение графа — используй для инференса и обновления весов.
+6. **`.detach()`** отрывает один тензор от графа — используй для логирования и передачи в NumPy.
+7. **`retain_graph=True`** сохраняет граф для повторного backward, но жрёт память.
+
+**Главный инсайт:** в Дне 1 ты был «математиком», который выводит формулы. В Дне 2 ты стал «инженером», который говорит PyTorch: «вот моя модель, посчитай градиенты сам». Это разграничение ответственности — ключ к масштабированию на глубокие сети.
+
+**Переходи к Дню 3, когда:**
+- Ты можешь объяснить, почему `loss.backward()` считает градиенты правильно (chain rule).
+- Твоя линейная регрессия с autograd даёт те же `w` и `b`, что и в Дне 1.
+- Ты понимаешь, зачем `with torch.no_grad()` при обновлении весов.
+- Ты знаешь, что произойдёт, если забыть `.zero_grad()` — и как это диагностировать.
