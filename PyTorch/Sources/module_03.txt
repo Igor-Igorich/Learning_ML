@@ -1,0 +1,1243 @@
+# День 3. `nn.Module` — объектно-ориентированные нейросети
+
+---
+
+## 1. Введение: от голых тензоров к архитектурам
+
+### 1.1. Мостик от Дня 1 и Дня 2
+
+В Дне 1 ты научился оперировать тензорами вручную. В Дне 2 ты переложил вычисление градиентов на `autograd` — и линейная регрессия превратилась из «математики на бумаге» в четыре строки: `forward → loss → backward → update`.
+
+Но у твоей линейной регрессии было всего два параметра — `w` и `b`, оба скаляры. Что если модель — это не «одна линия», а последовательность из десятков слоёв с тысячами параметров?
+
+```python
+# То, что у тебя было в Дне 2:
+w = torch.tensor(0.0, requires_grad=True)
+b = torch.tensor(0.0, requires_grad=True)
+y_pred = w * x + b
+
+# То, что нужно для реальной сети:
+W1 = torch.randn(784, 256, requires_grad=True)
+b1 = torch.randn(256, requires_grad=True)
+W2 = torch.randn(256, 128, requires_grad=True)
+b2 = torch.randn(128, requires_grad=True)
+W3 = torch.randn(128, 10, requires_grad=True)
+b3 = torch.randn(10, requires_grad=True)
+
+h1 = torch.relu(x @ W1 + b1)
+h2 = torch.relu(h1 @ W2 + b2)
+out = h2 @ W3 + b3
+```
+
+Уже на трёх слоях это превращается в мешанину имён `W1, b1, W2, b2, W3, b3`. А теперь представь: нужно сохранить эти веса на диск, перенести на GPU, включить/выключить Dropout для инференса, посчитать сколько всего параметров в модели. Вручную — это боль и источник багов.
+
+**`nn.Module`** — это система PyTorch для инкапсуляции: слои, их параметры и то, как данные текут через слои (`forward`), упаковываются в один объект. Это ООП поверх тензоров и autograd, которые ты уже знаешь.
+
+### 1.2. Цель дня
+
+После этого конспекта ты должен уметь:
+- Писать классы моделей через наследование от `nn.Module`.
+- Понимать, что происходит «под капотом» при объявлении слоя в `__init__`.
+- Собирать сети из `nn.Linear`, функций активации, `nn.Dropout`, `nn.BatchNorm1d`.
+- Правильно инициализировать веса (Xavier/Kaiming).
+- Сохранять и загружать модели через `state_dict`.
+- Переносить модель целиком на GPU одной командой.
+
+### 1.3. Связь с твоим бэкграundом
+
+Ты уже писал классы с `@property`, дандер-методами (`__init__`, `__call__`) и декораторами в Неделе 4 своего roadmap (Advanced Python). `nn.Module` — это просто применение тех же принципов ООП к специфической предметной области: слои нейросети. Ничего концептуально нового в плане ООП здесь нет — новое только в том, *что* инкапсулируется.
+
+---
+
+## 2. `nn.Module`: анатомия класса
+
+### 2.1. Минимальный пример
+
+```python
+import torch
+import torch.nn as nn
+
+class TinyModel(nn.Module):
+    def __init__(self):
+        super().__init__()               # ОБЯЗАТЕЛЬНО! Инициализирует внутренние структуры nn.Module
+        self.linear = nn.Linear(3, 1)    # слой = атрибут класса
+
+    def forward(self, x):
+        return self.linear(x)
+
+model = TinyModel()
+x = torch.randn(5, 3)     # батч из 5 примеров, 3 признака у каждого
+y = model(x)               # НЕ model.forward(x) напрямую!
+print(y.shape)              # torch.Size([5, 1])
+```
+
+**Два обязательных метода:**
+
+1. **`__init__`** — здесь ты **объявляешь** слои (создаёшь объекты `nn.Linear`, `nn.Conv2d`, и т.д.) как атрибуты `self`. Здесь НЕ происходит вычислений над данными — только объявление структуры.
+2. **`forward`** — здесь ты **описываешь**, как данные проходят через объявленные слои: в каком порядке, с какими операциями между ними (активации, конкатенации, ветвления).
+
+### 2.2. `super().__init__()` — почему это критично
+
+```python
+class BrokenModel(nn.Module):
+    def __init__(self):
+        # super().__init__()  <-- ЗАБЫЛИ
+        self.linear = nn.Linear(3, 1)
+
+model = BrokenModel()
+# AttributeError: cannot assign module before Module.__init__() call
+```
+
+**Что происходит под капотом:** `nn.Module.__init__()` создаёт несколько внутренних `OrderedDict`, в частности `self._parameters`, `self._modules`, `self._buffers`. Без вызова `super().__init__()` этих словарей не существует, и когда ты пишешь `self.linear = nn.Linear(3, 1)`, переопределённый `__setattr__` пытается зарегистрировать слой в `self._modules`, но словаря ещё нет — падает `AttributeError`.
+
+**Аналогия:** `super().__init__()` — это как включить электричество в доме, прежде чем расставлять мебель. Без этого шага дом (объект) не готов принимать «мебель» (слои).
+
+### 2.3. Что происходит при `self.linear = nn.Linear(3, 1)`
+
+`nn.Module` переопределяет магический метод `__setattr__`. Когда ты присваиваешь атрибуту объект типа `nn.Module` (например, `nn.Linear`), PyTorch **не** кладёт его в обычный `self.__dict__`, а автоматически регистрирует в `self._modules['linear']`.
+
+```python
+class TinyModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = nn.Linear(3, 1)
+        self.count = 42                    # обычный Python-атрибут, НЕ регистрируется
+
+model = TinyModel()
+print(model._modules)     # OrderedDict([('linear', Linear(in_features=3, out_features=1, bias=True))])
+print('count' in model._modules)   # False — это просто атрибут объекта
+```
+
+Аналогично, если ты присваиваешь `nn.Parameter` (тензор, помеченный как обучаемый параметр), он попадает в `self._parameters`. Это разграничение — ключевая причина, почему `.parameters()`, `.to(device)`, `.state_dict()` «просто работают»: они рекурсивно обходят `_modules` и `_parameters`, не заботясь, сколько там вложенности.
+
+### 2.4. `model(x)` vs `model.forward(x)` — зачем `__call__`
+
+**Никогда не вызывай `model.forward(x)` напрямую.** Всегда вызывай `model(x)`.
+
+```python
+class TinyModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = nn.Linear(3, 1)
+
+    def forward(self, x):
+        return self.linear(x)
+
+model = TinyModel()
+x = torch.randn(5, 3)
+
+y1 = model(x)            # ПРАВИЛЬНО
+y2 = model.forward(x)    # РАБОТАЕТ, но НЕПРАВИЛЬНО
+```
+
+**Почему `model.forward(x)` — плохая практика:** `nn.Module` определяет `__call__`, который делает больше, чем просто вызов `forward`:
+
+```python
+# Упрощённая версия того, что происходит внутри nn.Module.__call__:
+def __call__(self, *args, **kwargs):
+    for hook in self._forward_pre_hooks.values():
+        hook(self, args)                  # хуки ДО forward
+    result = self.forward(*args, **kwargs)
+    for hook in self._forward_hooks.values():
+        hook(self, args, result)          # хуки ПОСЛЕ forward
+    return result
+```
+
+`__call__` запускает **forward hooks** — механизм, на котором строятся, например, извлечение промежуточных активаций, `torch.utils.checkpoint` (экономия памяти), некоторые библиотеки визуализации (Captum, hooks для Grad-CAM). Если вызвать `model.forward(x)` напрямую, эти хуки **не сработают**, и код будет вести себя иначе в зависимости от того, как его вызвали — источник трудноуловимых багов.
+
+**Правило:** `forward()` ты *определяешь*, но никогда не *вызываешь* напрямую.
+
+---
+
+## 3. `nn.Linear` — линейный слой в деталях
+
+### 3.1. Математика под капотом
+
+`nn.Linear(in_features, out_features)` реализует аффинное преобразование:
+
+```
+y = x @ W.T + b
+```
+
+где:
+- `x` — вход, форма `(batch_size, in_features)`
+- `W` (weight) — матрица весов, форма `(out_features, in_features)`
+- `b` (bias) — вектор смещения, форма `(out_features,)`
+- `y` — выход, форма `(batch_size, out_features)`
+
+**Важный нюанс:** матрица весов хранится в форме `(out_features, in_features)`, а не `(in_features, out_features)`, как можно было бы ожидать. Поэтому в формуле — транспонирование `W.T`. Это сделано для эффективности вычислений на GPU (memory layout).
+
+### 3.2. Worked example — считаем вручную
+
+Пусть `in_features=3`, `out_features=2`. Один пример на входе (`batch_size=1`).
+
+```python
+import torch
+import torch.nn as nn
+
+torch.manual_seed(0)
+layer = nn.Linear(in_features=3, out_features=2)
+
+print(layer.weight)
+# Parameter containing:
+# tensor([[ 0.2975,  0.0135, -0.2385],
+#         [ 0.4362, -0.4553, -0.5310]], requires_grad=True)
+# форма: (2, 3) = (out_features, in_features)
+
+print(layer.bias)
+# Parameter containing:
+# tensor([0.3452, 0.2854], requires_grad=True)
+# форма: (2,) = (out_features,)
+
+x = torch.tensor([[1.0, 2.0, 3.0]])   # форма (1, 3) — batch_size=1, in_features=3
+y = layer(x)
+print(y)
+```
+
+Проверим вручную для первого выходного нейрона (`y[0][0]`):
+
+```
+y0 = w0·x + b0
+   = (0.2975·1 + 0.0135·2 - 0.2385·3) + 0.3452
+   = (0.2975 + 0.0270 - 0.7155) + 0.3452
+   = -0.3910 + 0.3452
+   = -0.0458
+```
+
+И для второго (`y[0][1]`):
+
+```
+y1 = w1·x + b1
+   = (0.4362·1 - 0.4553·2 - 0.5310·3) + 0.2854
+   = (0.4362 - 0.9106 - 1.5930) + 0.2854
+   = -2.0674 + 0.2854
+   = -1.7820
+```
+
+**Ключевой инсайт:** `nn.Linear` — это не что-то новое по сравнению с тем, что ты делал в Дне 1 (`x @ W.T + b`). Разница — только в том, что PyTorch сам создаёт `W` и `b` как `nn.Parameter`, инициализирует их разумным способом (см. раздел 8) и регистрирует их для `.parameters()` / `autograd`.
+
+### 3.3. Размерности: батч и многомерные входы
+
+`nn.Linear` работает не только с 2D-входом. Преобразование применяется к **последней размерности**, а все предыдущие рассматриваются как «батчевые».
+
+```python
+layer = nn.Linear(10, 5)
+
+x1 = torch.randn(32, 10)          # (batch, features) -> (32, 5)
+x2 = torch.randn(32, 7, 10)       # (batch, seq_len, features) -> (32, 7, 5)
+x3 = torch.randn(2, 32, 7, 10)    # любая размерность спереди -> (2, 32, 7, 5)
+
+print(layer(x1).shape)   # torch.Size([32, 5])
+print(layer(x2).shape)   # torch.Size([32, 7, 5])
+print(layer(x3).shape)   # torch.Size([2, 32, 7, 5])
+```
+
+Это важно для будущих модулей (последовательности, трансформеры), где вход имеет форму `(batch, seq_len, features)`.
+
+### 3.4. `bias=False`
+
+```python
+layer_no_bias = nn.Linear(10, 5, bias=False)
+print(layer_no_bias.bias)   # None
+```
+
+Используется, когда следом стоит `BatchNorm` — он сам вычитает среднее, и bias линейного слоя становится избыточным (см. раздел 9.2).
+
+---
+
+## 4. Функции активации: зачем нелинейность
+
+### 4.1. Проблема: стек линейных слоёв — всё ещё линеен
+
+```python
+# Два линейных слоя без активации между ними:
+h = x @ W1.T + b1
+y = h @ W2.T + b2
+
+# Подставим h:
+y = (x @ W1.T + b1) @ W2.T + b2
+  = x @ (W1.T @ W2.T) + (b1 @ W2.T + b2)
+  = x @ W_combined + b_combined
+```
+
+**Вывод:** без нелинейности между слоями любое количество линейных слоёв **математически эквивалентно одному линейному слою**. Вся «глубина» сети была бы бессмысленной. Функции активации — это то, что даёт сети способность аппроксимировать нелинейные зависимости (интуиция стоит за Universal Approximation Theorem — теоремой о том, что сеть с одним достаточно широким скрытым слоем и нелинейной активацией может приблизить любую непрерывную функцию).
+
+### 4.2. ReLU (Rectified Linear Unit)
+
+```
+ReLU(z) = max(0, z)
+```
+
+```python
+relu = nn.ReLU()
+x = torch.tensor([-2.0, -0.5, 0.0, 1.5, 3.0])
+print(relu(x))   # tensor([0.0000, 0.0000, 0.0000, 1.5000, 3.0000])
+```
+
+**Производная:**
+```
+ReLU'(z) = 1, если z > 0
+ReLU'(z) = 0, если z < 0
+ReLU'(z) = не определена в z=0 (PyTorch считает 0)
+```
+
+**Плюсы:**
+- Вычислительно дешевле (`max(0, z)` — одна операция сравнения), чем `sigmoid`/`tanh` (экспонента).
+- Не насыщается для положительных значений — градиент либо 0, либо 1, что смягчает проблему затухающих градиентов в глубоких сетях.
+
+**Минусы — «Dying ReLU»:**
+Если во время обучения нейрон получает вход `z < 0` систематически (например, из-за большого learning rate, который «выбил» веса в плохую область), то `ReLU(z) = 0`, и градиент через него `= 0`. Нейрон перестаёт обучаться — «умирает» навсегда, потому что градиент никогда не «оживит» веса обратно.
+
+### 4.3. Sigmoid
+
+```
+σ(z) = 1 / (1 + e^(-z))
+```
+
+Ты уже реализовывал эту функцию вручную в Неделе 4 своего roadmap (логистическая регрессия). Здесь та же формула, но как строительный блок сети.
+
+```python
+sigmoid = nn.Sigmoid()
+x = torch.tensor([-5.0, 0.0, 5.0])
+print(sigmoid(x))   # tensor([0.0067, 0.5000, 0.9933])
+```
+
+**Производная:**
+```
+σ'(z) = σ(z) · (1 - σ(z))
+```
+
+Максимум производной — при `z=0`: `σ'(0) = 0.5 · 0.5 = 0.25`. При `|z| > 5` производная практически равна нулю — **насыщение (saturation)**.
+
+**Проблема Vanishing Gradient:** в глубокой сети градиент, идущий назад через chain rule (День 2), — это **произведение** производных на каждом слое. Если на каждом слое `sigmoid` даёт производную ≤ 0.25, то через 10 слоёв градиент домножается на `0.25^10 ≈ 0.00000095` — практически исчезает. Ранние слои сети перестают обучаться. Именно поэтому `sigmoid` почти не используют во внутренних слоях современных сетей (только на выходе для бинарной классификации, и то — реже, см. День 4 про `BCEWithLogitsLoss`).
+
+### 4.4. Tanh
+
+```
+tanh(z) = (e^z - e^(-z)) / (e^z + e^(-z)) = 2σ(2z) - 1
+```
+
+```python
+tanh = nn.Tanh()
+x = torch.tensor([-5.0, 0.0, 5.0])
+print(tanh(x))   # tensor([-0.9999,  0.0000,  0.9999])
+```
+
+**Отличие от sigmoid:** выход в диапазоне `(-1, 1)` вместо `(0, 1)`, центрирован вокруг нуля. Это часто ускоряет сходимость (следующему слою не нужно компенсировать систематическое смещение входа). Максимум производной `tanh'(0) = 1` (больше, чем у sigmoid), но насыщение всё равно происходит при больших `|z|` — vanishing gradient остаётся проблемой, просто чуть менее выраженной.
+
+### 4.5. Сравнительная таблица
+
+| Активация | Диапазон | Производная (макс.) | Насыщается? | Когда использовать |
+|:---|:---|:---|:---|:---|
+| **ReLU** | `[0, +∞)` | 1 (или 0) | Только слева | **Стандарт для скрытых слоёв** большинства сетей |
+| **Sigmoid** | `(0, 1)` | 0.25 | Оба конца | Выходной слой бинарной классификации (реже — из-за `BCEWithLogitsLoss`, см. День 4) |
+| **Tanh** | `(-1, 1)` | 1.0 | Оба конца | Рекуррентные сети (LSTM/GRU), где центрирование входа важно |
+| **LeakyReLU** | `(-∞, +∞)` | 1 | Нет | Когда наблюдается Dying ReLU: `LeakyReLU(z) = z, если z>0, иначе α·z` (α≈0.01) |
+| **GELU** | `(-∞, +∞)` | ~1 | Почти нет | Трансформеры (BERT, GPT) — гладкая версия ReLU |
+
+**Практическое правило (запомни для собеседования):** скрытые слои → `ReLU` (или его вариации) по умолчанию, если не доказано обратное. Выходной слой → зависит от задачи (линейный для регрессии, ничего — если используешь `CrossEntropyLoss`/`BCEWithLogitsLoss`, которые сами включают активацию внутри, см. День 4).
+
+### 4.6. Функциональная vs модульная форма
+
+```python
+import torch.nn.functional as F
+
+class Model(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(10, 20)
+
+    def forward(self, x):
+        # Вариант А: модульная форма (self.relu = nn.ReLU() в __init__)
+        # Вариант Б: функциональная форма — короче, часто используется для активаций
+        return F.relu(self.fc1(x))
+```
+
+**Правило выбора:** для активаций без обучаемых параметров (ReLU, Tanh, Sigmoid) обычно используют функциональную форму `F.relu(...)` прямо в `forward` — короче код. Для слоёв **с** обучаемым состоянием (`nn.Linear`, `nn.Dropout`, `nn.BatchNorm1d` — да, Dropout и BatchNorm ведут себя по-разному в train/eval, это тоже «состояние») — обязательно модульная форма (`self.dropout = nn.Dropout(0.5)`), потому что `.eval()`/`.train()` управляют именно зарегистрированными модулями.
+
+---
+
+## 5. `nn.Sequential` — быстрая сборка простых архитектур
+
+### 5.1. Синтаксис
+
+Когда сеть — это просто цепочка слоёв без ветвлений, `nn.Sequential` избавляет от написания `forward` вручную:
+
+```python
+model = nn.Sequential(
+    nn.Linear(10, 64),
+    nn.ReLU(),
+    nn.Linear(64, 32),
+    nn.ReLU(),
+    nn.Linear(32, 1)
+)
+
+x = torch.randn(5, 10)
+y = model(x)          # forward уже реализован внутри Sequential
+print(y.shape)          # torch.Size([5, 1])
+```
+
+Это эквивалентно:
+
+```python
+class Model(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(10, 64)
+        self.relu1 = nn.ReLU()
+        self.fc2 = nn.Linear(64, 32)
+        self.relu2 = nn.ReLU()
+        self.fc3 = nn.Linear(32, 1)
+
+    def forward(self, x):
+        x = self.relu1(self.fc1(x))
+        x = self.relu2(self.fc2(x))
+        x = self.fc3(x)
+        return x
+```
+
+### 5.2. Именованные слои через `OrderedDict`
+
+```python
+from collections import OrderedDict
+
+model = nn.Sequential(OrderedDict([
+    ('fc1', nn.Linear(10, 64)),
+    ('relu1', nn.ReLU()),
+    ('fc2', nn.Linear(64, 1)),
+]))
+
+print(model.fc1)              # доступ по имени
+print(model[0])               # доступ по индексу — тоже работает
+```
+
+### 5.3. Когда `nn.Sequential` НЕ годится
+
+- **Несколько входов** (например, числовые + категориальные фичи, как в твоём Дне 5).
+- **Ветвления / skip-connections** (ResNet: `out = F(x) + x`).
+- **Условная логика** в forward (разное поведение в train/eval, кроме встроенного `.train()/.eval()`).
+- **Несколько выходов** (multi-task learning: classification + regression head).
+
+Во всех этих случаях — только полноценный класс с явным `forward`. Это и есть архитектура, которую ты соберёшь в Дне 6 для `TabularMLP` (числовые фичи + Embedding для категориальных, конкатенация — это уже не «просто цепочка»).
+
+---
+
+## 6. Параметры модели: `.parameters()`, `.named_parameters()`, `.state_dict()`
+
+### 6.1. `.parameters()` — итератор по всем обучаемым тензорам
+
+```python
+class SimpleNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(10, 20)
+        self.fc2 = nn.Linear(20, 1)
+
+    def forward(self, x):
+        return self.fc2(torch.relu(self.fc1(x)))
+
+model = SimpleNet()
+
+for p in model.parameters():
+    print(p.shape)
+# torch.Size([20, 10])   <- fc1.weight
+# torch.Size([20])       <- fc1.bias
+# torch.Size([1, 20])    <- fc2.weight
+# torch.Size([1])        <- fc2.bias
+```
+
+Именно этот итератор передают в оптимизатор (День 4): `optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)`. Оптимизатор не знает *архитектуру* — он просто получает плоский список тензоров с `requires_grad=True` и обновляет их.
+
+### 6.2. `.named_parameters()` — с именами, для отладки
+
+```python
+for name, p in model.named_parameters():
+    print(f"{name:15s} {str(p.shape):20s} requires_grad={p.requires_grad}")
+
+# fc1.weight      torch.Size([20, 10]) requires_grad=True
+# fc1.bias        torch.Size([20])     requires_grad=True
+# fc2.weight      torch.Size([1, 20])  requires_grad=True
+# fc2.bias        torch.Size([1])      requires_grad=True
+```
+
+**Практическое применение:** заморозка части сети (transfer learning — тема за пределами этого курса, но принцип важно знать):
+
+```python
+for name, p in model.named_parameters():
+    if 'fc1' in name:
+        p.requires_grad = False   # fc1 больше не обучается
+```
+
+### 6.3. Подсчёт числа параметров — worked example
+
+```python
+def count_parameters(model):
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return total, trainable
+
+total, trainable = count_parameters(model)
+print(f"Всего параметров: {total}")       # 20*10 + 20 + 1*20 + 1 = 200+20+20+1 = 241
+print(f"Обучаемых: {trainable}")
+```
+
+Проверим вручную:
+```
+fc1.weight: 20 × 10 = 200
+fc1.bias:   20
+fc2.weight: 1 × 20  = 20
+fc2.bias:   1
+-----------------------------
+Итого:      241
+```
+
+**Зачем это важно для собеседования:** ты должен уметь на лету прикинуть размер модели. Пример из Дня 2 (`784 → 256 → 128 → 10`):
+```
+Linear(784, 256): 784×256 + 256 = 200 960
+Linear(256, 128): 256×128 + 128 = 32 896
+Linear(128, 10):  128×10  + 10  = 1 290
+-----------------------------------------
+Итого: 235 146 параметров
+```
+При `float32` (4 байта на параметр) это `~940 КБ` только под веса, не считая градиентов и состояния оптимизатора (Adam хранит ещё 2 доп. буфера на параметр — итого модель «весит» в памяти во время обучения примерно в 3-4 раза больше, чем сами веса).
+
+### 6.4. `.state_dict()` — снимок состояния модели
+
+```python
+sd = model.state_dict()
+print(type(sd))          # <class 'collections.OrderedDict'>
+print(sd.keys())          # odict_keys(['fc1.weight', 'fc1.bias', 'fc2.weight', 'fc2.bias'])
+print(sd['fc1.weight'].shape)   # torch.Size([20, 10])
+```
+
+**Отличие от `.parameters()`:**
+- `.parameters()` — итератор **живых** тензоров (можно менять `requires_grad`, они участвуют в графе).
+- `.state_dict()` — `OrderedDict` с именами → **копиями значений** (detached), включая не только `nn.Parameter`, но и **буферы** (`_buffers`) — например, `running_mean`/`running_var` внутри `BatchNorm` (см. раздел 9.2), у которых `requires_grad=False`, но которые всё равно являются частью «состояния» модели и должны сохраняться/загружаться.
+
+Это ключевой механизм для сохранения/загрузки моделей — подробно в разделе 11.
+
+---
+
+## 7. Кастомные слои
+
+### 7.1. `nn.Parameter` — как объявить обучаемый тензор вручную
+
+Если нужно написать слой, которого нет в `torch.nn` «из коробки», используешь `nn.Parameter` — обёртку над тензором, которая говорит `nn.Module`: «зарегистрируй меня в `_parameters`, я обучаемый».
+
+```python
+class WeightedSum(nn.Module):
+    """Кастомный слой: взвешенная сумма N входных тензоров с обучаемыми весами."""
+    def __init__(self, n_inputs):
+        super().__init__()
+        # nn.Parameter оборачивает обычный тензор -> он попадёт в .parameters()
+        self.weights = nn.Parameter(torch.ones(n_inputs) / n_inputs)  # инициализация: равные веса
+
+    def forward(self, tensors_list):
+        # tensors_list: список из n_inputs тензоров одинаковой формы
+        stacked = torch.stack(tensors_list, dim=0)   # (n_inputs, batch, features)
+        w = torch.softmax(self.weights, dim=0)       # веса суммируются в 1
+        weighted = (stacked * w.view(-1, 1, 1)).sum(dim=0)
+        return weighted
+
+layer = WeightedSum(n_inputs=3)
+print(list(layer.parameters()))   # [Parameter containing: tensor([0.3333, 0.3333, 0.3333], requires_grad=True)]
+
+a = torch.randn(4, 5)
+b = torch.randn(4, 5)
+c = torch.randn(4, 5)
+out = layer([a, b, c])
+print(out.shape)   # torch.Size([4, 5])
+```
+
+**Почему нельзя просто `self.weights = torch.ones(n_inputs) / n_inputs`?**
+
+```python
+class Broken(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weights = torch.ones(3) / 3   # НЕ nn.Parameter!
+
+layer = Broken()
+print(list(layer.parameters()))   # [] — ПУСТО!
+```
+
+Обычный тензор — даже с `requires_grad=True` — не регистрируется в `_parameters` (потому что `nn.Module.__setattr__` проверяет именно тип `nn.Parameter`, а не произвольный тензор). Он не попадёт в `.parameters()`, значит — **оптимизатор его не увидит и не будет обновлять**. Это одна из самых частых скрытых ошибок при написании кастомных слоёв.
+
+### 7.2. Кастомный residual-блок (пример на будущее)
+
+```python
+class ResidualBlock(nn.Module):
+    """Skip-connection: out = F(x) + x. Требует, чтобы вход/выход были одной размерности."""
+    def __init__(self, dim):
+        super().__init__()
+        self.fc1 = nn.Linear(dim, dim)
+        self.fc2 = nn.Linear(dim, dim)
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        identity = x                        # сохраняем вход
+        out = self.relu(self.fc1(x))
+        out = self.fc2(out)
+        return self.relu(out + identity)    # skip-connection
+
+block = ResidualBlock(dim=64)
+x = torch.randn(8, 64)
+y = block(x)
+print(y.shape)   # torch.Size([8, 64])
+```
+
+Это ровно тот случай из раздела 5.3, где `nn.Sequential` не подходит — нужен явный `forward` из-за операции `out + identity`.
+
+---
+
+## 8. Инициализация весов: почему это критично
+
+### 8.1. Проблема плохой инициализации
+
+Если инициализировать все веса нулями:
+
+```python
+layer = nn.Linear(10, 10)
+nn.init.zeros_(layer.weight)
+```
+
+Все нейроны слоя получают **одинаковый градиент** на каждом шаге (симметрия не нарушена) — они обучаются идентично, и слой фактически вырождается в один нейрон. Сеть не может обучиться ничему полезному.
+
+Если инициализировать слишком большими значениями — активации взрываются по мере прохождения через слои (`exploding activations`), и на выходе — `NaN`. Если слишком маленькими — активации схлопываются к нулю (`vanishing activations`), и градиенты, идущие назад через них, тоже занулятся.
+
+**Задача правильной инициализации:** дисперсия активаций должна оставаться примерно одинаковой от слоя к слою — ни расти, ни падать экспоненциально с глубиной сети.
+
+### 8.2. Xavier / Glorot — для `tanh` / `sigmoid`
+
+Идея: дисперсия весов подбирается так, чтобы сохранить дисперсию сигнала при **прямом** и **обратном** проходе одновременно, усредняя между `fan_in` (число входов слоя) и `fan_out` (число выходов).
+
+```
+Var(W) = 2 / (fan_in + fan_out)
+```
+
+Равномерный вариант (`xavier_uniform_`):
+```
+bound = sqrt(6 / (fan_in + fan_out))
+W ~ Uniform(-bound, bound)
+```
+
+```python
+layer = nn.Linear(256, 128)
+nn.init.xavier_uniform_(layer.weight)
+nn.init.zeros_(layer.bias)   # bias обычно инициализируют нулями
+```
+
+Разработана для симметричных вокруг нуля активаций (`tanh`, `sigmoid`), у которых производная максимальна около нуля.
+
+### 8.3. Kaiming / He — для `ReLU`
+
+`ReLU` обнуляет примерно половину входов (все отрицательные). Xavier не учитывает это — поэтому для сетей с `ReLU` используется поправка Kaiming (He):
+
+```
+Var(W) = 2 / fan_in
+```
+
+(коэффициент `2` вместо `1` компенсирует то, что ReLU «выбрасывает» половину сигнала).
+
+```python
+layer = nn.Linear(256, 128)
+nn.init.kaiming_uniform_(layer.weight, nonlinearity='relu')
+nn.init.zeros_(layer.bias)
+```
+
+**Практическое правило:** если после слоя стоит `ReLU` (или его варианты) — используй Kaiming. Если `tanh`/`sigmoid` — Xavier. **По умолчанию** PyTorch уже инициализирует `nn.Linear` через `kaiming_uniform_` с `a=sqrt(5)` — поэтому явная инициализация в простых MLP часто не обязательна, но важно **понимать**, что происходит и уметь переопределить, когда архитектура нестандартная (это частый вопрос на собеседовании).
+
+### 8.4. Применение инициализации ко всей модели через `.apply()`
+
+```python
+class MLP(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(10, 64)
+        self.fc2 = nn.Linear(64, 32)
+        self.fc3 = nn.Linear(32, 1)
+
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        x = torch.relu(self.fc2(x))
+        return self.fc3(x)
+
+def init_weights(module):
+    """Применяется рекурсивно к каждому подмодулю через .apply()"""
+    if isinstance(module, nn.Linear):
+        nn.init.kaiming_uniform_(module.weight, nonlinearity='relu')
+        nn.init.zeros_(module.bias)
+
+model = MLP()
+model.apply(init_weights)   # рекурсивно обходит ВСЕ вложенные nn.Module
+```
+
+`.apply(fn)` рекурсивно вызывает `fn` для каждого подмодуля (используя тот же механизм обхода `_modules`, что и `.parameters()`, `.to(device)`). Это стандартный паттерн инициализации всей сети одной строкой.
+
+---
+
+## 9. Регуляризация в нейросетях
+
+### 9.1. Мостик к Bias-Variance Tradeoff
+
+В своём roadmap (Неделя 4) ты уже разбирал Bias-Variance Tradeoff и L2-регуляризацию (Ridge) в контексте логистической регрессии: штраф на веса снижает дисперсию модели ценой небольшого роста смещения. `Dropout` и `BatchNorm` — это регуляризация того же *духа* (борьба с переобучением / стабилизация обучения), но применённая специфично к нейросетям, а не через штраф в функции потерь.
+
+### 9.2. `nn.Dropout` — механизм
+
+**Идея:** во время обучения случайным образом «выключаем» (зануляем) долю нейронов на каждом шаге. Это заставляет сеть не полагаться на конкретные нейроны — учит более устойчивые, распределённые представления. Работает как неявный ансамбль множества «прореженных» подсетей.
+
+```python
+dropout = nn.Dropout(p=0.5)   # p — вероятность занулить нейрон
+
+x = torch.ones(1, 10)
+
+dropout.train()               # режим обучения
+print(dropout(x))
+# tensor([[2., 0., 2., 2., 0., 0., 2., 2., 0., 2.]])
+# половина элементов занулена, ОСТАВШИЕСЯ УМНОЖЕНЫ НА 1/(1-p) = 2
+
+dropout.eval()                # режим инференса
+print(dropout(x))
+# tensor([[1., 1., 1., 1., 1., 1., 1., 1., 1., 1.]])
+# Dropout НЕ применяется вообще — это identity-операция
+```
+
+**Inverted Dropout — почему оставшиеся элементы умножены на `1/(1-p)`:**
+
+Если во время обучения зануляется доля `p` нейронов, то **ожидаемая сумма** активаций уменьшается в `(1-p)` раз по сравнению с полной сетью. Если ничего не компенсировать, на инференсе (когда Dropout выключен и работают ВСЕ нейроны) сумма активаций будет систематически больше, чем во время обучения — распределение входа для следующего слоя «поедет».
+
+**Решение (inverted dropout, используется в PyTorch по умолчанию):** во время **обучения** оставшиеся активные нейроны домножаются на `1/(1-p)`, чтобы **ожидаемое** значение суммы совпадало с полной сетью. Тогда на инференсе можно просто отключить Dropout (identity) без какой-либо дополнительной перенормировки.
+
+```
+Обучение:  y = (x * mask) / (1 - p),  где mask — бинарная маска, mask_i ~ Bernoulli(1-p)
+Инференс:  y = x
+```
+
+**Критично: `.train()` и `.eval()`.** Если забыть переключить модель в `.eval()` перед инференсом, Dropout продолжит случайно зануляять нейроны — предсказания станут нестабильными (разные при каждом вызове на одном и том же входе). Это одна из самых частых ошибок новичков (раздел 13, День 7 в плане курса).
+
+### 9.3. `nn.BatchNorm1d` — нормализация по батчу
+
+**Идея:** нормализовать активации внутри слоя так, чтобы у них было среднее ≈0 и дисперсия ≈1 **внутри текущего батча**, а затем позволить сети «подстроить» это через два обучаемых параметра — масштаб `γ` (gamma) и сдвиг `β` (beta).
+
+**Формула (для одного признака, по батчу из N примеров):**
+
+```
+μ_B = (1/N) Σ x_i                     — среднее по батчу
+σ²_B = (1/N) Σ (x_i - μ_B)²           — дисперсия по батчу
+
+x̂_i = (x_i - μ_B) / sqrt(σ²_B + ε)     — нормализация (ε ~1e-5, защита от деления на 0)
+
+y_i = γ · x̂_i + β                      — обучаемое масштабирование и сдвиг
+```
+
+`γ` и `β` — **обучаемые параметры** (по одному на каждый признак), инициализируются `γ=1`, `β=0` (то есть в начале обучения `BatchNorm` — почти identity-преобразование после нормализации).
+
+```python
+bn = nn.BatchNorm1d(num_features=4)
+x = torch.tensor([[1.0, 2.0, 3.0, 4.0],
+                   [5.0, 6.0, 7.0, 8.0],
+                   [9.0, 10.0, 11.0, 12.0]])   # батч из 3 примеров, 4 признака
+
+bn.train()
+y = bn(x)
+print(y)
+# Каждый столбец (признак) нормализован независимо по всем 3 строкам (примерно mean=0, std=1)
+```
+
+**Зачем нужна нормализация:** без неё распределение входов каждого слоя постоянно «плывёт» по мере того, как обновляются веса предыдущих слоёв — это явление называется **Internal Covariate Shift**. `BatchNorm` стабилизирует это распределение, что на практике:
+- ускоряет сходимость (можно использовать больший learning rate),
+- слегка регуляризует (шум от статистик конкретного батча действует похоже на Dropout),
+- уменьшает чувствительность к инициализации весов.
+
+**Train vs Eval — running statistics:**
+
+На инференсе часто приходит **один** пример (`batch_size=1`) — посчитать `μ_B`/`σ²_B` по батчу из одного элемента не имеет смысла (дисперсия одного числа = 0). Поэтому `BatchNorm` во время **обучения** параллельно накапливает **скользящее среднее** статистик по всем виденным батчам:
+
+```
+running_mean = (1 - momentum) · running_mean + momentum · μ_B
+running_var  = (1 - momentum) · running_var  + momentum · σ²_B
+```
+
+(по умолчанию `momentum=0.1`). А во время **инференса** (`model.eval()`) `BatchNorm` использует именно **эти накопленные `running_mean`/`running_var`**, а не статистики текущего входа:
+
+```python
+bn.eval()
+y_infer = bn(torch.tensor([[2.0, 3.0, 4.0, 5.0]]))   # ОДИН пример — работает благодаря running stats
+```
+
+`running_mean` и `running_var` — это **буферы** (`_buffers`, не `_parameters`): у них `requires_grad=False` (не обучаются градиентным спуском), но они — часть состояния модели и **обязательно** сохраняются в `state_dict()` (иначе после загрузки модели `eval()`-инференс будет использовать статистики со случайной инициализации — предсказания будут неверными).
+
+### 9.4. Порядок слоёв: `Linear → BatchNorm → ReLU → Dropout`
+
+Стандартный (наиболее распространённый) порядок в блоке:
+
+```python
+class Block(nn.Module):
+    def __init__(self, in_dim, out_dim, dropout_p=0.3):
+        super().__init__()
+        self.fc = nn.Linear(in_dim, out_dim, bias=False)   # bias=False — избыточен перед BatchNorm!
+        self.bn = nn.BatchNorm1d(out_dim)
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(dropout_p)
+
+    def forward(self, x):
+        x = self.fc(x)
+        x = self.bn(x)
+        x = self.relu(x)
+        x = self.dropout(x)
+        return x
+```
+
+**Почему `bias=False` перед `BatchNorm`:** `BatchNorm` вычитает среднее по батчу — любое постоянное смещение (bias линейного слоя), добавленное перед этим, будет вычтено обратно на этапе нормализации. Bias становится «мёртвым» параметром — тратит память и немного вычислений без пользы. Это мелкая, но частая деталь, о которой спрашивают на собеседованиях.
+
+**Почему `Dropout` — после `ReLU`, а не до:** так активации сначала проходят нелинейность, а затем часть из них зануляется — это соответствует интуиции «выключаем случайные нейроны», а не «случайные пред-активации».
+
+---
+
+## 10. Перенос модели на GPU
+
+### 10.1. `model.to(device)` — что происходит
+
+```python
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+model = MLP()
+model = model.to(device)   # ВСЕ параметры и буферы переезжают на device
+```
+
+Так как `.to()` — это тоже рекурсивный обход `_parameters`, `_buffers` и `_modules` (тот же механизм, что у `.parameters()` и `.state_dict()`), одна команда переносит **абсолютно все** веса, bias'ы, `running_mean`/`running_var` внутри `BatchNorm` — вообще всё зарегистрированное состояние модели.
+
+**Важная деталь:** `model.to(device)` для `nn.Module` — операция **in-place** (в отличие от `tensor.to(device)`, которая возвращает новый тензор!). Но по конвенции всё равно принято писать `model = model.to(device)` — так код читается единообразно что для тензоров, что для моделей, и не ломается, если внутреннюю реализацию `.to()` когда-нибудь изменят.
+
+### 10.2. Типичная ошибка: device mismatch
+
+```python
+model = MLP().to('cuda')
+x = torch.randn(5, 10)   # ЗАБЫЛИ перенести на GPU — остался на CPU!
+
+y = model(x)
+# RuntimeError: Expected all tensors to be on the same device,
+# but found at least two devices, cuda:0 and cpu!
+```
+
+**Решение:** перенеси **и модель, и данные** на один device:
+
+```python
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+model = MLP().to(device)
+x = x.to(device)
+y = model(x)   # OK
+```
+
+**Практика (best practice для тренировочного цикла):** определи `device` один раз в начале скрипта и передавай его явно в каждый батч:
+
+```python
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model.to(device)
+
+for X_batch, y_batch in dataloader:      # предвосхищение Дня 5
+    X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+    ...
+```
+
+---
+
+## 11. Сохранение и загрузка моделей
+
+### 11.1. Два подхода
+
+**Подход А (рекомендуемый): сохранять только `state_dict`.**
+
+```python
+torch.save(model.state_dict(), 'model_weights.pth')
+```
+
+Сохраняет **только** значения весов (`OrderedDict` с именами тензоров), без архитектуры и без кода класса.
+
+**Подход Б (НЕ рекомендуется для production): сохранять всю модель.**
+
+```python
+torch.save(model, 'full_model.pth')
+```
+
+Сериализует объект целиком через `pickle`, включая ссылку на класс `MLP`. **Проблема:** при загрузке PyTorch должен импортировать точно тот же класс `MLP` из того же модуля/файла, с той же структурой кода. Если ты переименуешь файл, изменишь класс или перенесёшь код в другой проект — загрузка сломается или подгрузит не то. Кроме того, `pickle` в принципе небезопасен для загрузки файлов из непроверенных источников (может исполнять произвольный код) — это отдельная причина избегать этого подхода в проде.
+
+### 11.2. Загрузка через `state_dict` — правильный паттерн
+
+```python
+# 1. Сначала создаём объект модели С ТОЙ ЖЕ архитектурой (класс должен быть определён в коде)
+model = MLP()
+
+# 2. Загружаем сохранённый state_dict
+state_dict = torch.load('model_weights.pth', weights_only=True)   # weights_only=True — безопаснее
+
+# 3. Применяем веса к модели
+model.load_state_dict(state_dict)
+
+# 4. Переключаем в режим инференса (см. раздел 9.2, 9.3 про Dropout/BatchNorm)
+model.eval()
+```
+
+**`weights_only=True`** (доступно в актуальных версиях PyTorch) ограничивает `torch.load` только десериализацией тензоров, без исполнения произвольного pickle-кода — снижает риск при загрузке файлов из непроверенных источников. Стоит использовать по умолчанию, если не нужно грузить сложные объекты внутри чекпоинта (например, состояние оптимизатора с кастомными типами).
+
+### 11.3. `strict=True/False` — частичная загрузка
+
+```python
+model.load_state_dict(state_dict, strict=True)   # по умолчанию
+# RuntimeError, если ключи в state_dict и model.state_dict() не совпадают ТОЧНО
+
+model.load_state_dict(state_dict, strict=False)
+# Загружает только совпадающие ключи, остальные — предупреждение, но не ошибка
+```
+
+`strict=False` полезен, например, если ты дообучаешь модель с изменённой «головой» (последним слоем) — загружаешь веса всех слоёв, кроме последнего, который переинициализирован под новую задачу.
+
+### 11.4. Полный чекпоинт для возобновления обучения
+
+Для продолжения обучения (не только инференса) обычно сохраняют больше, чем просто веса модели:
+
+```python
+checkpoint = {
+    'epoch': epoch,
+    'model_state_dict': model.state_dict(),
+    'optimizer_state_dict': optimizer.state_dict(),   # см. День 4 — у Adam есть своё состояние!
+    'loss': loss,
+}
+torch.save(checkpoint, 'checkpoint.pth')
+
+# Загрузка:
+checkpoint = torch.load('checkpoint.pth', weights_only=True)
+model.load_state_dict(checkpoint['model_state_dict'])
+optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+start_epoch = checkpoint['epoch']
+```
+
+Это шаблон, который ты будешь использовать в Дне 6 для сохранения «лучшей модели по val-loss» с возможностью Early Stopping.
+
+---
+
+## 12. Практика: `SimpleMLP` для бинарной классификации
+
+### 12.1. Постановка задачи
+
+Синтетические 2D-данные — два переплетающихся кластера (используем `sklearn.datasets.make_moons`, классическая нелинейно разделимая задача — прямая линия НЕ сможет разделить классы, а логистическая регрессия из твоего roadmap с ней не справится; для этого и нужна нелинейная сеть).
+
+### 12.2. Полный код
+
+```python
+import torch
+import torch.nn as nn
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.datasets import make_moons
+from sklearn.model_selection import train_test_split
+
+torch.manual_seed(42)
+np.random.seed(42)
+
+# ============================================
+# 1. Данные
+# ============================================
+
+X, y = make_moons(n_samples=1000, noise=0.2, random_state=42)
+X_train, X_val, y_train, y_val = train_test_split(
+    X, y, test_size=0.2, stratify=y, random_state=42
+)
+
+# Конвертация в тензоры
+X_train_t = torch.tensor(X_train, dtype=torch.float32)
+y_train_t = torch.tensor(y_train, dtype=torch.float32).unsqueeze(1)   # (N,) -> (N, 1)
+X_val_t = torch.tensor(X_val, dtype=torch.float32)
+y_val_t = torch.tensor(y_val, dtype=torch.float32).unsqueeze(1)
+
+print(f"Train: {X_train_t.shape}, Val: {X_val_t.shape}")
+# Train: torch.Size([800, 2]), Val: torch.Size([200, 2])
+
+# ============================================
+# 2. Модель: SimpleMLP с 2 скрытыми слоями
+# ============================================
+
+class SimpleMLP(nn.Module):
+    """MLP для бинарной классификации: 2 входных признака -> 1 логит на выходе.
+    Архитектура: [Linear -> BatchNorm -> ReLU -> Dropout] x 2 -> Linear."""
+
+    def __init__(self, in_features=2, hidden_dim=32, dropout_p=0.3):
+        super().__init__()
+
+        self.block1 = nn.Sequential(
+            nn.Linear(in_features, hidden_dim, bias=False),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout_p),
+        )
+        self.block2 = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim, bias=False),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout_p),
+        )
+        # Выходной слой: 1 логит (БЕЗ sigmoid здесь!
+        # sigmoid будет применён внутри BCEWithLogitsLoss в Дне 4 — так численно стабильнее)
+        self.output = nn.Linear(hidden_dim, 1)
+
+        self.apply(self._init_weights)   # инициализация Kaiming для всех Linear-слоёв
+
+    @staticmethod
+    def _init_weights(module):
+        if isinstance(module, nn.Linear):
+            nn.init.kaiming_uniform_(module.weight, nonlinearity='relu')
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+
+    def forward(self, x):
+        x = self.block1(x)
+        x = self.block2(x)
+        logits = self.output(x)
+        return logits   # возвращаем СЫРЫЕ логиты, не вероятности
+
+model = SimpleMLP(in_features=2, hidden_dim=32, dropout_p=0.3)
+print(model)
+
+total_params = sum(p.numel() for p in model.parameters())
+print(f"Всего параметров: {total_params}")
+
+# ============================================
+# 3. Цикл обучения (вручную, без torch.optim — предвосхищаем День 4)
+# ============================================
+
+criterion = nn.BCEWithLogitsLoss()   # сигмоида + binary cross-entropy, численно стабильно
+learning_rate = 0.1
+n_epochs = 300
+
+train_losses, val_losses = [], []
+train_accs, val_accs = [], []
+
+def compute_accuracy(logits, y_true):
+    """logits -> вероятности через sigmoid -> порог 0.5 -> accuracy"""
+    with torch.no_grad():
+        probs = torch.sigmoid(logits)
+        preds = (probs >= 0.5).float()
+        return (preds == y_true).float().mean().item()
+
+for epoch in range(n_epochs):
+    # --- Режим обучения: включает Dropout, BatchNorm считает батчевые статистики ---
+    model.train()
+
+    logits = model(X_train_t)                  # forward
+    loss = criterion(logits, y_train_t)         # loss
+
+    model.zero_grad()                            # обнуляем градиенты ВСЕХ параметров модели
+    loss.backward()                               # backward — считает d(loss)/d(param) для каждого параметра
+
+    # Обновление весов вручную (torch.no_grad(), чтобы не строить граф для самого обновления)
+    with torch.no_grad():
+        for p in model.parameters():
+            p -= learning_rate * p.grad
+
+    train_acc = compute_accuracy(logits, y_train_t)
+
+    # --- Режим оценки: Dropout выключен, BatchNorm использует running stats ---
+    model.eval()
+    with torch.no_grad():
+        val_logits = model(X_val_t)
+        val_loss = criterion(val_logits, y_val_t)
+        val_acc = compute_accuracy(val_logits, y_val_t)
+
+    train_losses.append(loss.item())
+    val_losses.append(val_loss.item())
+    train_accs.append(train_acc)
+    val_accs.append(val_acc)
+
+    if (epoch + 1) % 50 == 0:
+        print(f"Эпоха {epoch+1:3d} | train_loss={loss.item():.4f} acc={train_acc:.3f} "
+              f"| val_loss={val_loss.item():.4f} acc={val_acc:.3f}")
+
+# ============================================
+# 4. Визуализация decision boundary
+# ============================================
+
+def plot_decision_boundary(model, X, y, ax, title):
+    model.eval()
+    x_min, x_max = X[:, 0].min() - 0.5, X[:, 0].max() + 0.5
+    y_min, y_max = X[:, 1].min() - 0.5, X[:, 1].max() + 0.5
+    xx, yy = np.meshgrid(np.linspace(x_min, x_max, 200),
+                          np.linspace(y_min, y_max, 200))
+    grid = torch.tensor(np.c_[xx.ravel(), yy.ravel()], dtype=torch.float32)
+
+    with torch.no_grad():
+        probs = torch.sigmoid(model(grid)).numpy().reshape(xx.shape)
+
+    ax.contourf(xx, yy, probs, levels=50, cmap='RdBu', alpha=0.6)
+    ax.scatter(X[y == 0, 0], X[y == 0, 1], c='blue', edgecolors='k', label='Класс 0')
+    ax.scatter(X[y == 1, 0], X[y == 1, 1], c='red', edgecolors='k', label='Класс 1')
+    ax.set_title(title)
+    ax.legend()
+
+fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+plot_decision_boundary(model, X_train, y_train, axes[0], 'Decision Boundary (train)')
+
+axes[1].plot(train_losses, label='train loss')
+axes[1].plot(val_losses, label='val loss')
+axes[1].set_xlabel('Эпоха')
+axes[1].set_ylabel('BCE Loss')
+axes[1].set_title('Кривые обучения')
+axes[1].legend()
+axes[1].grid(True)
+
+axes[2].plot(train_accs, label='train acc')
+axes[2].plot(val_accs, label='val acc')
+axes[2].set_xlabel('Эпоха')
+axes[2].set_ylabel('Accuracy')
+axes[2].set_title('Точность')
+axes[2].legend()
+axes[2].grid(True)
+
+plt.tight_layout()
+plt.savefig('day3_mlp_moons.png', dpi=150)
+plt.show()
+
+# ============================================
+# 5. Сохранение и загрузка state_dict — проверка идентичности
+# ============================================
+
+torch.save(model.state_dict(), 'simple_mlp_weights.pth')
+print("Веса сохранены в simple_mlp_weights.pth")
+
+# Создаём НОВЫЙ объект модели (те же гиперпараметры, случайная инициализация)
+model_loaded = SimpleMLP(in_features=2, hidden_dim=32, dropout_p=0.3)
+
+# До загрузки — предсказания РАЗНЫЕ (веса случайные)
+model.eval()
+model_loaded.eval()
+with torch.no_grad():
+    pred_before = torch.sigmoid(model_loaded(X_val_t[:5]))
+    pred_original = torch.sigmoid(model(X_val_t[:5]))
+print("\nДо загрузки весов:")
+print(f"Оригинальная модель: {pred_original.squeeze().tolist()}")
+print(f"Новая модель (случайные веса): {pred_before.squeeze().tolist()}")
+
+# Загружаем сохранённые веса
+state_dict = torch.load('simple_mlp_weights.pth', weights_only=True)
+model_loaded.load_state_dict(state_dict)
+model_loaded.eval()
+
+with torch.no_grad():
+    pred_after = torch.sigmoid(model_loaded(X_val_t[:5]))
+
+print("\nПосле загрузки весов:")
+print(f"Оригинальная модель: {pred_original.squeeze().tolist()}")
+print(f"Загруженная модель:  {pred_after.squeeze().tolist()}")
+
+assert torch.allclose(pred_original, pred_after), "Предсказания должны совпадать!"
+print("\n✓ Предсказания ПОЛНОСТЬЮ совпадают — state_dict загружен корректно.")
+```
+
+### 12.3. Разбор ключевых моментов кода
+
+**Почему `y_train_t.unsqueeze(1)`:**
+```python
+y_train_t = torch.tensor(y_train, dtype=torch.float32).unsqueeze(1)   # (N,) -> (N, 1)
+```
+Выход модели (`self.output = nn.Linear(hidden_dim, 1)`) имеет форму `(batch_size, 1)`. `BCEWithLogitsLoss` требует, чтобы форма `target` совпадала с формой `input` — иначе сработает broadcasting не туда, куда нужно (типичная скрытая ошибка: `(N,)` и `(N, 1)` broadcast'ятся в `(N, N)` без явной ошибки, но с абсолютно неверным loss).
+
+**Почему выходной слой БЕЗ sigmoid внутри `forward`:**
+```python
+self.output = nn.Linear(hidden_dim, 1)
+...
+logits = self.output(x)
+return logits   # сырые логиты
+```
+`nn.BCEWithLogitsLoss` **сам** применяет `sigmoid` внутри, но делает это численно стабильным способом (через log-sum-exp трюк, аналогичный тому, что ты писал вручную для `compute_log_loss` с клиппингом в Неделе 4 своего roadmap). Если применить `sigmoid` вручную в `forward`, а потом передать в `BCELoss` (не `WithLogits`), при экстремальных значениях логитов может случиться `log(0) = -inf`. Подробно — в Дне 4, но важно запомнить сейчас: **модель возвращает логиты**, sigmoid — только для интерпретации (`compute_accuracy` вызывает `torch.sigmoid(logits)` отдельно).
+
+**Почему `model.zero_grad()`, а не `optimizer.zero_grad()`:**
+В этом дне мы ещё не используем `torch.optim` (это День 4) — обновляем веса вручную, как в Дне 2. `model.zero_grad()` обходит все параметры модели и обнуляет их `.grad` — эквивалент того, что `optimizer.zero_grad()` будет делать в Дне 4, только напрямую через модель, а не через оптимизатор.
+
+**Почему `model.train()` / `model.eval()` вызываются на каждой итерации:**
+```python
+model.train()      # перед forward на train-данных
+...
+model.eval()        # перед forward на val-данных
+```
+`Dropout` и `BatchNorm` внутри `SimpleMLP` ведут себя по-разному в этих двух режимах (разделы 9.2, 9.3). Если не переключать режим явно перед каждым forward-проходом, ты либо:
+- посчитаешь val_loss с включённым Dropout (случайным зашумлением) — метрика будет заниженной и нестабильной от запуска к запуску;
+- либо (что хуже) обучишь модель с `BatchNorm` в `eval()`-режиме — она будет использовать ещё не накопленные `running_mean`/`running_var` (изначально `mean=0, var=1`), что может серьёзно испортить сходимость.
+
+**Почему обновление весов происходит внутри `torch.no_grad()`:**
+```python
+with torch.no_grad():
+    for p in model.parameters():
+        p -= learning_rate * p.grad
+```
+Ты уже видел этот паттерн в Дне 2. Причина та же: если убрать `torch.no_grad()`, операция `p -= ...` попытается сама попасть в граф вычислений (потому что `p.requires_grad=True`), что и приведёт к ошибке `a leaf Variable that requires grad is being used in an in-place operation` (см. Ошибка 2 в конспекте Дня 2).
+
+### 12.4. Ожидаемое поведение
+
+- `train_loss` и `val_loss` должны падать, `train_acc`/`val_acc` — расти, приближаясь к `~95-99%` (задача `make_moons` с `noise=0.2` разделима нелинейной границей почти идеально).
+- На графике decision boundary должна появиться характерная «S-образная» изогнутая граница между двумя классами — то, что линейная модель (логрег без нелинейности) в принципе не смогла бы построить.
+- После загрузки `state_dict` в новую модель предсказания должны **побитово совпадать** с оригинальной моделью (`torch.allclose` вернёт `True`) — это подтверждает, что вся архитектура (включая `running_mean`/`running_var` внутри `BatchNorm`!) была сохранена и восстановлена корректно.
+
+---
+
+## 13. Типичные ошибки Дня 3
+
+| Ошибка | Причина | Решение |
+|:---|:---|:---|
+| `AttributeError: cannot assign module before Module.__init__() call` | Забыл `super().__init__()` в кастомном классе | Первая строка `__init__` — всегда `super().__init__()` |
+| `model.parameters()` возвращает пустой список | Слой объявлен как обычный тензор, а не `nn.Parameter`, или создан не в `__init__` | Оборачивай обучаемые тензоры в `nn.Parameter`, объявляй слои в `__init__` |
+| Предсказания нестабильны при повторном вызове на одном входе | Забыл `model.eval()` перед инференсом — Dropout продолжает работать | Всегда `model.eval()` перед валидацией/инференсом, `model.train()` перед следующим шагом обучения |
+| `ValueError: Expected more than 1 value per channel when training` | `BatchNorm1d` получил батч из **1** примера в режиме `train()` | Не используй `batch_size=1` при обучении с `BatchNorm`, либо замени на `GroupNorm`/`LayerNorm` |
+| Loss = `NaN` уже на первых эпохах | Слишком большой `learning_rate` при ручном обновлении весов, или плохая инициализация | Уменьши `learning_rate`, проверь `nn.init.kaiming_uniform_` для ReLU-сетей |
+| `RuntimeError: size mismatch` в `BCEWithLogitsLoss` | `target` формы `(N,)`, а `logits` формы `(N, 1)` | `.unsqueeze(1)` для `target`, либо `.squeeze(1)` для `logits` — приведи формы к одной |
+| После `torch.load` модель выдаёт другие предсказания, чем до сохранения | Забыл вызвать `.eval()` на загруженной модели (Dropout/BatchNorm остались в train-режиме) | Всегда `.eval()` сразу после `load_state_dict()`, если модель нужна для инференса |
+| `RuntimeError: Expected all tensors to be on the same device` | Модель на GPU, входные данные остались на CPU (или наоборот) | `.to(device)` явно и для модели, и для каждого батча данных |
+
+---
+
+## 14. Чек-лист навыков Дня 3
+
+| Навык | Проверь себя |
+|:---|:---|
+| Объяснить, зачем нужен `super().__init__()` в кастомном `nn.Module` | ☐ |
+| Объяснить разницу между `_parameters`, `_modules`, `_buffers` внутри `nn.Module` | ☐ |
+| Объяснить, почему `model(x)`, а не `model.forward(x)` | ☐ |
+| Вывести формулу `nn.Linear` и посчитать выход вручную на маленьком примере | ☐ |
+| Объяснить, зачем нужна нелинейность между линейными слоями | ☐ |
+| Сравнить ReLU, Sigmoid, Tanh — плюсы/минусы, vanishing gradient, dying ReLU | ☐ |
+| Собрать модель через `nn.Sequential` и через явный класс с `forward` | ☐ |
+| Посчитать число обучаемых параметров модели вручную | ☐ |
+| Объяснить разницу `.parameters()` vs `.state_dict()` | ☐ |
+| Написать кастомный слой с `nn.Parameter` | ☐ |
+| Объяснить разницу Xavier vs Kaiming, когда какую использовать | ☐ |
+| Объяснить механизм Dropout (inverted dropout) и разницу train/eval | ☐ |
+| Объяснить формулу BatchNorm и зачем нужны running_mean/running_var | ☐ |
+| Перенести модель на GPU одной командой и объяснить, что произойдёт при device mismatch | ☐ |
+| Сохранить/загрузить модель через `state_dict`, объяснить, почему не через pickle всей модели | ☐ |
+| Собрать и обучить `SimpleMLP` на `make_moons`, визуализировать decision boundary | ☐ |
+
+---
+
+## 15. Итоги Дня 3
+
+**Что ты теперь знаешь:**
+
+1. **`nn.Module`** — это ООП-обёртка над тензорами и autograd: `__init__` объявляет слои (регистрируются в `_modules`/`_parameters`), `forward` описывает вычисления.
+2. **`nn.Linear`** реализует `y = x @ W.T + b` — то же самое, что ты писал руками в Дне 1, только с автоматической инициализацией и регистрацией параметров.
+3. **Функции активации** обязательны между линейными слоями — без них глубина сети бессмысленна (стек линейных слоёв = один линейный слой). ReLU — стандарт по умолчанию, sigmoid/tanh страдают от vanishing gradient в глубоких сетях.
+4. **`.parameters()` / `.state_dict()`** — механизм, на котором держится весь остальной API: оптимизаторы, `.to(device)`, сохранение/загрузка.
+5. **Инициализация весов** (Xavier для tanh/sigmoid, Kaiming для ReLU) — не случайная деталь, а математически обоснованный способ сохранить дисперсию сигнала на всех слоях сети.
+6. **Dropout и BatchNorm** — регуляризация специфичная для нейросетей, но той же природы, что L2/Ridge из классического ML: борьба с переобучением и нестабильностью. Оба **ведут себя по-разному** в `.train()` и `.eval()` — забыть переключить режим — источник самых частых и незаметных багов.
+7. **`state_dict`** — правильный способ сохранять модели: имена → тензоры, включая буферы (`running_mean`/`running_var`), без завязки на код класса.
+
+**Главный инсайт:** `nn.Module` не добавляет ничего математически нового по сравнению с Днями 1-2 — это **организационный** слой поверх тензоров и autograd. Как только архитектура растёт с 2 параметров (линейная регрессия) до тысяч (MLP), без этой организации код становится неуправляемым. Именно поэтому production-код (в том числе твой будущий `pytorch_fraud_mlp.ipynb` из Дня 6) всегда пишется через `nn.Module`, а не через голые тензоры.
+
+**Связь с Т-Банком и твоим roadmap:** банковские модели (в частности, антифрод — твой проект FraudGuard) в 90% случаев используют градиентный бустинг (LightGBM/CatBoost), а не нейросети — именно потому, что на табличных данных бустинг обычно даёт лучшее качество при меньших затратах на инфраструктуру. Но интервьюер на позицию ML-инженера в банке вполне может спросить про `nn.Module`, Dropout или BatchNorm — как проверку фундаментальных знаний DL, даже если ты не будешь использовать PyTorch в первом проекте на работе. Понимание `train()/eval()` семантики также напрямую переносится на объяснение, почему в sklearn `Pipeline` `fit()` вызывается только на train (Data Leakage, который ты уже разбирал) — концептуально то же разграничение «режима обучения» и «режима применения».
+
+**Переходи к Дню 4, когда:**
+- Ты можешь с нуля написать класс `nn.Module` с `__init__` и `forward` без подглядывания.
+- Ты понимаешь, почему `model.eval()` критичен перед валидацией/инференсом, если в модели есть Dropout или BatchNorm.
+- Твой `SimpleMLP` на `make_moons` обучается стабильно и даёт нелинейную decision boundary.
+- Ты можешь объяснить, что произойдёт, если забыть `nn.Parameter` при написании кастомного слоя.
+- Ты понимаешь разницу между сохранением `state_dict` и сохранением всей модели через `pickle`, и можешь объяснить, почему первое — стандарт.
+
+В Дне 4 ты заменишь ручное обновление весов (`p -= learning_rate * p.grad`) на `torch.optim.Adam`/`SGD`, разберёшь `CrossEntropyLoss`/`BCEWithLogitsLoss` подробнее и добавишь `scheduler` для управления `learning_rate` по ходу обучения.
