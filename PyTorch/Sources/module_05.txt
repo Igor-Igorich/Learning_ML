@@ -1,0 +1,974 @@
+# День 5. `Dataset` и `DataLoader` — промышленная подготовка данных
+
+---
+
+## 1. Введение: открываем «чёрный ящик» из Дня 4
+
+### 1.1. Мостик от Дня 4
+
+В Дне 4 ты уже использовал `DataLoader`, но как готовый инструмент:
+
+```python
+train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+
+for X_batch, y_batch in train_loader:
+    ...
+```
+
+Ты не задавал себе вопросов: откуда `train_loader` знает, сколько всего примеров в датасете? Как он решает, какие именно примеры попадут в конкретный батч? Что произойдёт, если примеры имеют разную структуру (например, картинки разного размера или тексты разной длины)? Сегодня — весь этот механизм становится прозрачным, и ты напишешь свой собственный `Dataset` с нуля.
+
+### 1.2. Зачем это нужно именно тебе
+
+Готовые датасеты (`torchvision.datasets.FashionMNIST`, как в Дне 4) существуют только для эталонных бенчмарков. В реальной работе — в том числе в твоём будущем `Fraud Detection Lite` (День 6) — данные лежат в CSV, PostgreSQL или Kafka-топике (ты уже проектировал это в FraudGuard), и никакого готового класса `torchvision.datasets.MyBankData` не существует. Тебе придётся написать `Dataset` самому — сегодня ты научишься делать это правильно.
+
+### 1.3. Цель дня
+
+После этого конспекта ты должен уметь:
+- Объяснить контракт `Dataset` (`__len__`, `__getitem__`) и почему `DataLoader` требует именно эти два метода.
+- Написать кастомный `Dataset` для табличных данных поверх `pandas.DataFrame`.
+- Осознанно настраивать параметры `DataLoader` (`batch_size`, `shuffle`, `num_workers`, `drop_last`, `pin_memory`) и объяснять физический смысл каждого.
+- Писать кастомный `collate_fn` для нестандартных данных.
+- Правильно разделять данные на train/val/test **без утечки статистик нормализации**.
+- Использовать `nn.Embedding` для категориальных признаков высокой кардинальности — вместо one-hot.
+
+---
+
+## 2. `torch.utils.data.Dataset` — абстрактный контракт
+
+### 2.1. Зачем нужна абстракция вообще
+
+`DataLoader` — это универсальный «диспетчер», который умеет: перемешивать индексы, собирать их в батчи, параллельно подгружать данные в фоновых процессах, переносить готовые батчи в закреплённую память для GPU. Но `DataLoader` **не знает**, откуда конкретно брать данные — это может быть CSV на диске, изображения в папках, строки из PostgreSQL или тензоры уже в памяти.
+
+**Решение — паттерн, знакомый тебе по ООП из Advanced Python (Неделя 4 твоего roadmap):** абстрактный интерфейс. `Dataset` — это контракт: «если твой класс умеет ответить на два вопроса — сколько всего примеров и как получить пример номер `i` — я (`DataLoader`) сделаю с ним всё остальное: перемешаю, соберу в батчи, распараллелю загрузку». `DataLoader` работает с **любым** объектом, реализующим этот контракт, не зная ничего о внутреннем устройстве данных.
+
+### 2.2. Контракт: `__len__` и `__getitem__`
+
+```python
+from torch.utils.data import Dataset
+
+class MyDataset(Dataset):
+    def __len__(self):
+        """Возвращает общее число примеров в датасете."""
+        raise NotImplementedError
+
+    def __getitem__(self, idx: int):
+        """Возвращает ОДИН пример по индексу idx: (признаки, метка) или просто признаки."""
+        raise NotImplementedError
+```
+
+Это **map-style** датасет (наиболее распространённый тип) — он ведёт себя как словарь/список: по целочисленному индексу `idx` можно получить конкретный пример за `O(1)` (в идеале). Существует также **iterable-style** датасет (наследуется от `torch.utils.data.IterableDataset`, реализует `__iter__` вместо `__getitem__`) — используется для потоковых источников данных, где случайный доступ по индексу физически невозможен (например, чтение построчно из бесконечного Kafka-топика, знакомого тебе по MarketPulse). В этом курсе фокус — на map-style, это стандарт для табличных и большинства других задач.
+
+### 2.3. Минимальный рабочий пример
+
+```python
+import torch
+from torch.utils.data import Dataset
+
+class SimpleDataset(Dataset):
+    def __init__(self, X: torch.Tensor, y: torch.Tensor):
+        self.X = X
+        self.y = y
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+X = torch.randn(100, 5)
+y = torch.randint(0, 2, (100,))
+
+dataset = SimpleDataset(X, y)
+
+print(len(dataset))          # 100 — вызывает __len__
+x_sample, y_sample = dataset[42]   # вызывает __getitem__(42)
+print(x_sample.shape, y_sample)     # torch.Size([5]) tensor(1)
+```
+
+**Важно:** `dataset[42]` работает благодаря тому, что Python под капотом транслирует `obj[idx]` в вызов `obj.__getitem__(idx)` — тот же механизм дандер-методов, с которым ты уже работал в Advanced Python (Неделя 4 твоего roadmap), только здесь он не для кастомного контейнера общего назначения, а для интеграции с экосистемой PyTorch.
+
+### 2.4. Как `DataLoader` использует этот контракт (концептуально)
+
+```python
+# Упрощённая модель того, что делает DataLoader "под капотом" при shuffle=True:
+import random
+
+indices = list(range(len(dataset)))
+random.shuffle(indices)                     # использует __len__ для получения диапазона индексов
+
+batch_size = 32
+for i in range(0, len(indices), batch_size):
+    batch_indices = indices[i:i+batch_size]
+    batch = [dataset[idx] for idx in batch_indices]   # использует __getitem__ для каждого индекса
+    # ... затем batch "склеивается" в единые тензоры через collate_fn (раздел 4.6)
+```
+
+`DataLoader` знает только эти два метода — и этого достаточно, чтобы реализовать перемешивание, батчинг, параллельную загрузку и склейку данных совершенно универсальным образом, не зная ничего о конкретной структуре твоих данных.
+
+---
+
+## 3. Кастомный `Dataset` для табличных данных
+
+### 3.1. Обёртка над `pandas.DataFrame`
+
+```python
+import pandas as pd
+import torch
+from torch.utils.data import Dataset
+
+class TabularDatasetV1(Dataset):
+    """Наивная версия — конвертация в тензор при КАЖДОМ обращении. Медленно (см. раздел 3.2)."""
+
+    def __init__(self, df: pd.DataFrame, feature_cols: list, target_col: str):
+        self.df = df
+        self.feature_cols = feature_cols
+        self.target_col = target_col
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        x = torch.tensor(row[self.feature_cols].values.astype('float32'))
+        y = torch.tensor(row[self.target_col], dtype=torch.float32)
+        return x, y
+```
+
+### 3.2. Почему это медленно — и как сделать правильно
+
+**Проблема:** `df.iloc[idx]` и `torch.tensor(...)` вызываются на **каждый** доступ к примеру — то есть тысячи раз за эпоху (по разу на каждый пример), и это происходит внутри `pandas`, который не оптимизирован под точечный построчный доступ в таком объёме. При `num_workers > 0` (раздел 4.3) эти операции ещё и дублируются в нескольких процессах.
+
+**Решение:** конвертировать весь датасет в тензоры **один раз**, в `__init__`, а `__getitem__` делать максимально дешёвым — просто индексацией по уже готовому тензору:
+
+```python
+class TabularDataset(Dataset):
+    """Правильная версия — конвертация в тензоры ОДИН РАЗ в __init__."""
+
+    def __init__(self, df: pd.DataFrame, feature_cols: list, target_col: str):
+        # Конвертация происходит один раз при создании объекта
+        self.X = torch.tensor(df[feature_cols].values, dtype=torch.float32)
+        self.y = torch.tensor(df[target_col].values, dtype=torch.float32).unsqueeze(1)
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        # Просто индексация по уже готовому тензору — быстро
+        return self.X[idx], self.y[idx]
+```
+
+**Практическое правило:** любая тяжёлая, повторяющаяся для каждого примера работа (парсинг, конвертация типов, декодирование) должна происходить **один раз** в `__init__`, если данные помещаются в память целиком. `__getitem__` должен быть максимально «тонким» — просто вернуть уже готовый кусок данных. Исключение — когда данные физически не помещаются в память (например, миллионы изображений на диске) — тогда чтение с диска неизбежно происходит в `__getitem__`, и именно для компенсации этой задержки существует `num_workers` (раздел 4.3).
+
+### 3.3. Множественный вывод: `x_numeric, x_categorical, y`
+
+`__getitem__` не обязан возвращать ровно два значения — можно вернуть кортеж любой структуры, если код, читающий батчи, знает эту структуру:
+
+```python
+class MultiInputDataset(Dataset):
+    def __init__(self, X_numeric, X_categorical, y):
+        self.X_numeric = X_numeric
+        self.X_categorical = X_categorical
+        self.y = y
+
+    def __len__(self):
+        return len(self.y)
+
+    def __getitem__(self, idx):
+        return self.X_numeric[idx], self.X_categorical[idx], self.y[idx]
+
+# При итерации по DataLoader теперь три значения на батч:
+for x_num_batch, x_cat_batch, y_batch in loader:
+    ...
+```
+
+Это ровно тот паттерн, который понадобится в практике этого дня (раздел 9) — числовые и категориальные признаки нужно обрабатывать по-разному внутри модели (`nn.Linear` для числовых, `nn.Embedding` для категориальных, см. раздел 7), поэтому их удобно держать раздельными уже на уровне `Dataset`.
+
+---
+
+## 4. `DataLoader` — параметры в деталях
+
+### 4.1. `batch_size`
+
+```python
+loader = DataLoader(dataset, batch_size=64)
+```
+
+Число примеров, объединяемых в один вызов `forward`/`backward`. Больший `batch_size` — более стабильная (менее шумная) оценка градиента за шаг, но больше памяти и, потенциально, хуже способность «выбираться» из плохих локальных областей (шум от маленьких батчей иногда помогает избежать острых минимумов — это уже за рамками курса, но полезно знать как явление).
+
+### 4.2. `shuffle`
+
+```python
+train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)    # train: ОБЯЗАТЕЛЬНО True
+val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)       # val/test: False
+```
+
+**Почему `True` для train:** если не перемешивать данные, модель будет видеть примеры в одном и том же порядке каждую эпоху. Если в исходных данных есть скрытая структура по порядку (например, данные отсортированы по дате или по классу), сеть может «выучить» артефакты этого порядка, а не реальные закономерности — особенно опасно для `BatchNorm` (раздел 9.3 Дня 3), чья статистика батча начинает зависеть от систематического состава батча.
+
+**Почему `False` для val/test:** нет смысла перемешивать — метрики на валидации не зависят от порядка (мы усредняем по всей выборке), а фиксированный порядок упрощает воспроизводимость и сравнение метрик между эпохами/экспериментами.
+
+### 4.3. `num_workers` — параллельная загрузка данных
+
+```python
+loader = DataLoader(dataset, batch_size=64, num_workers=4)
+```
+
+**Проблема, которую решает `num_workers`:** пока GPU считает `forward`/`backward` для текущего батча, CPU может параллельно **уже готовить следующий батч** — читать данные с диска, декодировать изображения, применять трансформации. Без этого GPU периодически простаивает, ожидая, пока CPU однопоточно подготовит очередной батч (типичная ситуация для датасетов с медленным I/O — декодирование JPEG, чтение с сетевого диска).
+
+**Как это работает физически:** `num_workers=4` означает, что PyTorch порождает **4 отдельных процесса операционной системы** (не потока!) — каждый со своей копией `Dataset`. Это критично для твоего понимания GIL из Advanced Python (Неделя 4 твоего roadmap): если бы это были потоки (`threading`), GIL заблокировал бы параллельное выполнение Python-кода для CPU-bound операций (парсинг, декодирование). Использование **процессов** (`multiprocessing`, а не `threading`) обходит GIL полностью — каждый процесс работает независимо, с собственным интерпретатором.
+
+**Важный нюанс — копирование `Dataset` в каждый процесс:** объект `Dataset` копируется (на Linux — через `fork`, копирование памяти процесса; на Windows — через `spawn`, повторный импорт модуля и пересоздание объекта). Если в `__init__` твоего `Dataset` открыт файловый дескриптор или лежит несериализуемый объект (например, живое соединение с БД) — это может сломаться или работать не так, как ожидается, при `num_workers > 0`.
+
+**Обязательное правило для Windows:** если используешь `num_workers > 0` на Windows (где нет `fork`, только `spawn`), код запуска обучения **обязан** быть обёрнут в `if __name__ == '__main__':` — иначе каждый порождённый дочерний процесс при повторном импорте модуля снова попытается запустить весь скрипт целиком, включая порождение новых дочерних процессов — бесконечная рекурсия порождения процессов.
+
+```python
+# main.py — правильно для Windows
+def main():
+    train_loader = DataLoader(train_dataset, batch_size=64, num_workers=4)
+    for epoch in range(n_epochs):
+        train_one_epoch(...)
+
+if __name__ == '__main__':
+    main()
+```
+
+**Практическое правило подбора `num_workers`:** начинать с числа физических ядер CPU (или чуть меньше), проверять эмпирически — слишком большое число workers создаёт оверхед на межпроцессное взаимодействие и может **замедлить**, а не ускорить загрузку, особенно если данные и так быстро читаются из оперативной памяти (как в сегодняшней практике — синтетический табличный датасет, целиком лежащий в RAM, почти не выигрывает от `num_workers > 0`, потому что I/O здесь не является узким местом).
+
+### 4.4. `drop_last`
+
+```python
+loader = DataLoader(dataset, batch_size=64, drop_last=True)
+```
+
+Если `len(dataset)` не делится нацело на `batch_size`, последний батч будет **меньше** остальных (например, при 1000 примерах и `batch_size=64` последний батч — из 40 примеров). `drop_last=True` просто **отбрасывает** этот неполный последний батч.
+
+**Прямая связь с Днём 3:** ты уже видел ошибку `ValueError: Expected more than 1 value per channel when training` — она возникает, если `BatchNorm1d` в режиме `train()` получает батч размера **1** (дисперсия одного числа не определена). Если `len(dataset) % batch_size == 1`, последний батч эпохи будет содержать ровно один пример — и обучение упадёт именно на этом батче. `drop_last=True` — стандартная защита от этого edge case при использовании `BatchNorm`.
+
+**Для val/test `drop_last` обычно `False`** (по умолчанию) — на валидации мы хотим оценить метрику на **всех** примерах без исключения, few extra примеров в последнем неполном батче не создают проблемы (`BatchNorm` в `eval()`-режиме использует `running_mean`/`running_var`, а не батчевую статистику — размер батча там не критичен, см. раздел 9.3 Дня 3).
+
+### 4.5. `pin_memory` — ускорение переноса на GPU
+
+```python
+loader = DataLoader(dataset, batch_size=64, pin_memory=True)
+
+# В цикле обучения:
+X_batch = X_batch.to(device, non_blocking=True)
+```
+
+**Физика происходящего:** обычная оперативная память в Python — «paged» (страничная, может быть вытеснена операционной системой на диск в любой момент). Перенос данных из такой памяти на GPU требует промежуточного шага: сначала CPU копирует данные во временный «закреплённый» (page-locked, pinned) буфер, и только потом — на GPU через DMA (Direct Memory Access, прямой доступ к памяти в обход CPU).
+
+`pin_memory=True` заставляет `DataLoader` сразу размещать готовые батчи в **закреплённой** памяти — тогда перенос на GPU идёт напрямую через DMA, без промежуточного копирования. В сочетании с `non_blocking=True` при `.to(device)` это позволяет **перекрыть по времени** передачу данных на GPU с вычислениями на GPU для предыдущего батча (асинхронность) — суммарное время обучения сокращается.
+
+**Практическое правило:** `pin_memory=True` имеет смысл только при обучении на GPU (`cuda`). На CPU-only тренировках — бесполезно, только лишний расход памяти.
+
+### 4.6. `collate_fn` — как батч «склеивается» из отдельных примеров
+
+**Дефолтное поведение:** если каждый `dataset[i]` возвращает тензоры одинаковой формы, `DataLoader` по умолчанию просто **стекует** их (`torch.stack`) по новой размерности (batch dimension):
+
+```python
+# Дефолтный collate (упрощённо):
+def default_collate(batch):
+    # batch: [(x_0, y_0), (x_1, y_1), ..., (x_{B-1}, y_{B-1})]
+    xs = torch.stack([item[0] for item in batch])   # (B, ...)
+    ys = torch.stack([item[1] for item in batch])   # (B, ...)
+    return xs, ys
+```
+
+**Проблема:** `torch.stack` требует, чтобы все складываемые тензоры были **строго одной формы**. Если данные — последовательности **разной** длины (переменной длины текстовые предложения, временные ряды разной продолжительности), дефолтный `collate_fn` упадёт с ошибкой несовпадения размерностей.
+
+**Решение — кастомный `collate_fn` с паддингом:**
+
+```python
+import torch
+from torch.nn.utils.rnn import pad_sequence
+
+def variable_length_collate(batch):
+    """batch: список кортежей (sequence_tensor, label), sequences РАЗНОЙ длины.
+    Дефолтный collate упадёт, пытаясь сложить тензоры разной формы в один torch.stack."""
+    sequences, labels = zip(*batch)
+    lengths = torch.tensor([len(seq) for seq in sequences])
+
+    # pad_sequence дополняет все последовательности нулями до длины самой длинной в батче
+    padded = pad_sequence(sequences, batch_first=True, padding_value=0)
+
+    labels = torch.stack(labels)
+    return padded, lengths, labels
+
+loader = DataLoader(variable_length_dataset, batch_size=32, collate_fn=variable_length_collate)
+```
+
+Это не относится напрямую к сегодняшней табличной практике (там все примеры фиксированной формы — дефолтный `collate_fn` работает без проблем), но это универсальный механизм, который тебе понадобится, если курс когда-нибудь дойдёт до последовательностей (временные ряды транзакций пользователя, текст) — данные там почти никогда не имеют фиксированной длины.
+
+---
+
+## 5. Разделение данных: `random_split` и `Subset`
+
+### 5.1. `torch.utils.data.random_split`
+
+```python
+from torch.utils.data import random_split
+
+dataset = TabularDataset(df, feature_cols, target_col)
+
+train_size = int(0.7 * len(dataset))
+val_size = int(0.15 * len(dataset))
+test_size = len(dataset) - train_size - val_size   # остаток, чтобы избежать потери примеров из-за округления
+
+generator = torch.Generator().manual_seed(42)       # для воспроизводимости разбиения
+train_ds, val_ds, test_ds = random_split(
+    dataset, [train_size, val_size, test_size], generator=generator
+)
+
+print(len(train_ds), len(val_ds), len(test_ds))
+```
+
+**Почему `test_size` вычисляется как остаток, а не отдельным `int(0.15 * len(dataset))`:** из-за округления `int(0.7*N) + int(0.15*N) + int(0.15*N)` может не совпасть с `N` (потерять или получить лишний пример). Вычисление последней части как остатка (`N - train_size - val_size`) гарантирует, что сумма частей точно равна `N`.
+
+**`generator` — зачем явный объект, а не просто `torch.manual_seed(42)` перед вызовом:** `random_split` принимает свой собственный генератор случайных чисел, независимый от глобального. Это позволяет контролировать воспроизводимость разбиения данных отдельно от воспроизводимости инициализации весов модели или порядка перемешивания в `DataLoader` — три независимых источника случайности, которые иногда нужно фиксировать по отдельности.
+
+### 5.2. `Subset` — что возвращает `random_split`
+
+`random_split` возвращает объекты класса `torch.utils.data.Subset` — обёртку, которая хранит ссылку на **исходный** датасет и список индексов, принадлежащих этой части:
+
+```python
+print(type(train_ds))         # <class 'torch.utils.data.dataset.Subset'>
+print(train_ds.indices[:5])   # [742, 15, 8801, ...]  — конкретные индексы из исходного dataset
+print(train_ds.dataset is dataset)   # True — Subset не копирует данные, только хранит индексы!
+```
+
+`Subset.__getitem__(i)` внутри делает `self.dataset[self.indices[i]]` — то есть **не дублирует** данные в памяти, а просто перенаправляет обращение к исходному объекту по нужному индексу. Это эффективно по памяти, но означает, что **любая трансформация, зашитая в исходный `dataset`, будет применена одинаково ко всем частям** — что подводит к критичному нюансу следующего раздела.
+
+### 5.3. Скрытая ловушка: `random_split` + нормализация внутри `Dataset` = утечка данных
+
+**Опасный паттерн:**
+
+```python
+class LeakyDataset(Dataset):
+    def __init__(self, df, feature_cols, target_col):
+        # ОПАСНО: StandardScaler.fit_transform() считает mean/std по ВСЕМ данным сразу —
+        # включая те строки, что потом попадут в val/test через random_split!
+        from sklearn.preprocessing import StandardScaler
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(df[feature_cols])   # fit на ВСЁМ df — до разбиения!
+        self.X = torch.tensor(X_scaled, dtype=torch.float32)
+        self.y = torch.tensor(df[target_col].values, dtype=torch.float32).unsqueeze(1)
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+full_dataset = LeakyDataset(df, feature_cols, target_col)   # нормализация УЖЕ применена здесь
+train_ds, val_ds, test_ds = random_split(full_dataset, [...])   # разбиение — уже ПОСЛЕ утечки
+```
+
+Это ровно тот же **Data Leakage**, который ты уже детально разбирал в контексте `sklearn.Pipeline`/`ColumnTransformer` (Неделя 5 твоего roadmap): `StandardScaler.fit()` вычисляет среднее и дисперсию по **всему** датасету, включая примеры, которые логически должны были остаться «невидимыми» до момента оценки на val/test. Даже если после этого сделать формально честный `random_split`, статистики нормализации уже «просочились» из val/test в параметры трансформации, применённой к train.
+
+### 5.4. Правильный порядок операций
+
+```python
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+
+# 1. Сначала — разбиение СЫРОГО DataFrame (до какой-либо нормализации!)
+df_train, df_temp = train_test_split(df, test_size=0.3, stratify=df[target_col], random_state=42)
+df_val, df_test = train_test_split(df_temp, test_size=0.5, stratify=df_temp[target_col], random_state=42)
+
+# 2. Затем — fit ТОЛЬКО на train
+scaler = StandardScaler()
+scaler.fit(df_train[feature_cols])
+
+# 3. Создаём ТРИ отдельных объекта Dataset, передавая уже готовый (fit-нутый) scaler —
+#    каждый Dataset применяет только .transform(), никогда .fit() на val/test
+train_dataset = TabularDataset(df_train, scaler, feature_cols, target_col)
+val_dataset = TabularDataset(df_val, scaler, feature_cols, target_col)
+test_dataset = TabularDataset(df_test, scaler, feature_cols, target_col)
+```
+
+где `TabularDataset` принимает уже **готовый** объект `scaler` и вызывает только `.transform()` внутри `__init__` (не `.fit_transform()`). Это — паттерн, который будет использован в практике этого дня (раздел 9), и это прямая аналогия правилу «fit только на train», которое ты уже применял для `StandardScaler` внутри `sklearn.Pipeline`.
+
+**Формулировка правила для собеседования:** разделение данных должно происходить **до** вычисления любых статистик трансформации (среднее, дисперсия, частоты категорий) — не важно, работаешь ли ты с `sklearn.Pipeline` или с `torch.utils.data.Dataset`. `random_split`/`Subset` — удобный механизм **разбиения индексов**, но он не защищает от утечки, если нормализация была «зашита» внутрь датасета до разбиения — ответственность за корректный порядок операций всегда лежит на разработчике.
+
+---
+
+## 6. Нормализация: применение `StandardScaler` к тензорам
+
+### 6.1. Полный workflow
+
+```python
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+import torch
+
+# 1. Split
+df_train, df_val = train_test_split(df, test_size=0.2, stratify=df['target'], random_state=42)
+
+# 2. Fit только на train
+scaler = StandardScaler()
+scaler.fit(df_train[feature_cols])
+
+# 3. Transform train и val (одними и теми же параметрами scaler'а)
+X_train_scaled = scaler.transform(df_train[feature_cols])   # numpy array
+X_val_scaled = scaler.transform(df_val[feature_cols])        # используются mean/std, посчитанные на train!
+
+# 4. Конвертация в тензоры
+X_train_tensor = torch.tensor(X_train_scaled, dtype=torch.float32)
+X_val_tensor = torch.tensor(X_val_scaled, dtype=torch.float32)
+```
+
+### 6.2. Почему `dtype=torch.float32`, а не `float64`
+
+`sklearn` по умолчанию работает с `float64` (двойная точность). PyTorch по умолчанию использует `float32` (одинарная точность) для всех вычислений на GPU — GPU-архитектуры оптимизированы под `float32`/`float16`, а `float64` на них считается заметно медленнее и потребляет вдвое больше памяти. Явное указание `dtype=torch.float32` при конвертации из NumPy — обязательная привычка, иначе PyTorch создаст тензор `float64`, что может привести к неявному приведению типов и падению производительности (или ошибке несовпадения типов при последующих операциях с весами модели, которые по умолчанию `float32`).
+
+---
+
+## 7. Категориальные признаки в PyTorch
+
+### 7.1. One-Hot через `nn.functional.one_hot`
+
+```python
+import torch
+import torch.nn.functional as F
+
+categories = torch.tensor([0, 2, 1, 3])   # индексы категорий, 4 уникальные категории (0..3)
+one_hot = F.one_hot(categories, num_classes=4)
+print(one_hot)
+# tensor([[1, 0, 0, 0],
+#         [0, 0, 1, 0],
+#         [0, 1, 0, 0],
+#         [0, 0, 0, 1]])
+```
+
+**Когда уместно:** малое число категорий (до ~10-15). Результат — бинарный вектор, который можно напрямую конкатенировать с числовыми признаками и подать в `nn.Linear`.
+
+**Проблема при большой кардинальности:** если категория — это, например, `card1` из твоего FraudGuard (тысячи уникальных значений идентификаторов карт), one-hot вектор будет размерности в тысячи элементов, **почти полностью состоящий из нулей** — неэффективно по памяти, и `nn.Linear` после такого входа будет иметь огромную, в основном бесполезную матрицу весов (большая часть которой обучается на постоянно нулевых входах для конкретного примера).
+
+### 7.2. `nn.Embedding` — обучаемая плотная замена one-hot
+
+**Идея:** вместо разреженного one-hot-вектора размерности `num_categories`, каждой категории сопоставляется **плотный** обучаемый вектор фиксированной, обычно гораздо меньшей размерности `embedding_dim`.
+
+```python
+embedding = nn.Embedding(num_embeddings=1000, embedding_dim=16)
+# num_embeddings — общее число уникальных категорий (размер "словаря")
+# embedding_dim — размерность плотного вектора для каждой категории
+
+idx = torch.tensor([3, 999, 0, 42])   # индексы категорий в батче
+vectors = embedding(idx)
+print(vectors.shape)   # torch.Size([4, 16]) — каждый индекс превратился в вектор длины 16
+```
+
+### 7.3. Математика: Embedding — это lookup, а не полноценное умножение
+
+Внутри `nn.Embedding` хранится обучаемая матрица весов `W` формы `(num_embeddings, embedding_dim)` — по одной строке на каждую категорию:
+
+```python
+print(embedding.weight.shape)   # torch.Size([1000, 16])
+```
+
+`embedding(idx)` — это просто **выборка строк** этой матрицы по индексам:
+
+```
+Embedding(idx) = W[idx, :]
+```
+
+**Ключевая связь с one-hot:** математически это эквивалентно `one_hot(idx) @ W` (умножение one-hot-вектора на матрицу весов выбирает ровно ту строку `W`, где стоит единица в one-hot). Но `Embedding` **не строит** промежуточный one-hot-вектор и не делает полноценное матричное умножение — он напрямую индексирует нужную строку. Это даёт вычислительную сложность `O(embedding_dim)` за один lookup вместо `O(num_categories × embedding_dim)` за эквивалентное матричное умножение — принципиально важно, когда `num_categories` — десятки тысяч.
+
+### 7.4. Worked example — считаем вручную
+
+```python
+torch.manual_seed(0)
+embedding = nn.Embedding(num_embeddings=5, embedding_dim=3)
+print(embedding.weight)
+# Parameter containing:
+# tensor([[ 1.5410, -0.2934, -2.1788],   <- вектор для категории 0
+#         [ 0.5684, -1.0845, -1.3986],   <- вектор для категории 1
+#         [ 0.4033,  0.8380, -0.7193],   <- вектор для категории 2
+#         [-0.4033, -0.5966,  0.1820],   <- вектор для категории 3
+#         [-0.8567,  1.1006, -1.0712]],  <- вектор для категории 4
+#        requires_grad=True)
+
+idx = torch.tensor([2, 0])
+print(embedding(idx))
+# tensor([[ 0.4033,  0.8380, -0.7193],   <- строка 2, скопирована как есть
+#         [ 1.5410, -0.2934, -2.1788]],  <- строка 0, скопирована как есть
+#        grad_fn=<EmbeddingBackward0>)
+```
+
+Никакой арифметики — просто копирование нужных строк. Но эти строки — **обучаемые параметры** (`requires_grad=True`, есть `grad_fn`), и градиент через `backward()` (День 2) обновит **только те строки**, которые были задействованы в текущем батче — остальные категории, не встретившиеся в этом батче, останутся неизменными на этом шаге (это называется разреженностью обновления градиента для Embedding-слоёв, важная деталь для больших словарей категорий).
+
+### 7.5. Эвристика выбора `embedding_dim`
+
+Единого точного правила нет, но распространённая эвристика (популяризована библиотекой fast.ai, часто используется как разумный дефолт):
+
+```
+embedding_dim ≈ min(50, (num_categories + 1) // 2)
+```
+
+```python
+def suggested_embedding_dim(num_categories: int) -> int:
+    return min(50, (num_categories + 1) // 2)
+
+print(suggested_embedding_dim(5))       # min(50, 3) = 3
+print(suggested_embedding_dim(100))     # min(50, 50) = 50
+print(suggested_embedding_dim(10000))   # min(50, 5000) = 50 — размерность ограничена сверху
+```
+
+**Интуиция:** для категорий с малой кардинальностью (например, `education_level` из 4 значений) нет смысла в большом embedding — 2-3 измерений достаточно, чтобы разделить 4 категории. Для категорий с высокой кардинальностью (например, `card1` с тысячами уникальных значений) размерность растёт, но **не бесконечно** — верхний предел (`50` в этой эвристике) не даёт embedding-слою стать неоправданно большим и склонным к переобучению на редких категориях.
+
+### 7.6. `nn.ModuleList` — регистрация списка embedding-слоёв
+
+Если категориальных признаков несколько, нужен отдельный `nn.Embedding` под каждый:
+
+```python
+class Broken(nn.Module):
+    def __init__(self, cardinalities, dims):
+        super().__init__()
+        # ОПАСНО: обычный Python list!
+        self.embeddings = [nn.Embedding(c, d) for c, d in zip(cardinalities, dims)]
+
+model = Broken([5, 8, 4], [3, 4, 2])
+print(list(model.parameters()))   # [] — ПУСТО!
+```
+
+Это **ровно та же ошибка**, что ты уже разбирал в Дне 3 с `nn.Parameter`: обычный Python `list` — не то, что `nn.Module.__setattr__` умеет распознать и зарегистрировать в `_modules`. Слои внутри такого списка физически существуют и работают в `forward`, но полностью «невидимы» для `.parameters()`, `.to(device)`, `.state_dict()` — оптимизатор их не увидит и никогда не обновит.
+
+**Решение — `nn.ModuleList`:**
+
+```python
+class Correct(nn.Module):
+    def __init__(self, cardinalities, dims):
+        super().__init__()
+        self.embeddings = nn.ModuleList([
+            nn.Embedding(c, d) for c, d in zip(cardinalities, dims)
+        ])
+
+    def forward(self, x_categorical):
+        # x_categorical: (batch, n_categorical_features)
+        embedded = [emb(x_categorical[:, i]) for i, emb in enumerate(self.embeddings)]
+        return torch.cat(embedded, dim=1)
+
+model = Correct([5, 8, 4], [3, 4, 2])
+print(sum(p.numel() for p in model.parameters()))   # 5*3 + 8*4 + 4*2 = 15+32+8 = 55 — теперь видно всё
+```
+
+`nn.ModuleList` — специальный контейнер именно для случая «список подмодулей переменной длины», который `nn.Module.__setattr__` распознаёт и обходит рекурсивно точно так же, как одиночные атрибуты-слои.
+
+---
+
+## 8. `torchvision.transforms` — краткий обзор
+
+Этот курс сфокусирован на табличных данных, поэтому `torchvision.transforms` — вне основного фокуса, но ты уже неявно использовал один трансформ в Дне 4 (`transforms.ToTensor()`), поэтому важно понимать общий механизм.
+
+```python
+from torchvision import transforms
+
+transform = transforms.Compose([
+    transforms.Resize((224, 224)),                    # изменение размера изображения
+    transforms.ToTensor(),                              # PIL Image (0-255) -> Tensor (0.0-1.0)
+    transforms.Normalize(mean=[0.485, 0.456, 0.406],   # стандартизация по каналам (аналог StandardScaler,
+                          std=[0.229, 0.224, 0.225]),  # но с фиксированными "эталонными" mean/std для ImageNet)
+])
+```
+
+`transforms.Compose` — тот же принцип, что `sklearn.Pipeline`: последовательность трансформаций применяется одна за другой. `transforms.Normalize` концептуально — тот же `StandardScaler`, но с **заранее известными** константами (посчитанными когда-то на ImageNet), а не вычисляемыми `.fit()` на текущих данных — потому что для изображений с камеры или из интернета нет смысла каждый раз пересчитывать статистику, обычно используют устоявшиеся эталонные значения. Обычно такой `transform` передаётся в `Dataset.__init__` и применяется внутри `__getitem__` к каждому изображению индивидуально (в отличие от табличных данных, где мы конвертируем всё сразу, раздел 3.2 — для изображений это часто невозможно из-за объёма памяти, поэтому трансформация происходит «на лету», при каждом обращении).
+
+---
+
+## 9. Практика: `TabularDataset` для кредитного скоринга
+
+### 9.1. Постановка задачи
+
+Синтетический датасет кредитного скоринга: 10 числовых признаков + 3 категориальных, бинарная цель (дефолт / не дефолт). Задача сознательно близка к духу твоего FraudGuard — банковский табличный датасет с дисбалансом классов, только реализованный через PyTorch, а не через LightGBM.
+
+### 9.2. Генерация данных
+
+```python
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import roc_auc_score, average_precision_score
+
+np.random.seed(42)
+torch.manual_seed(42)
+
+n_samples = 20_000
+
+# --- Числовые признаки ---
+income = np.random.lognormal(mean=10.5, sigma=0.6, size=n_samples)
+age = np.random.randint(18, 70, size=n_samples)
+debt_ratio = np.random.beta(2, 5, size=n_samples)
+credit_history_years = np.random.randint(0, 40, size=n_samples)
+num_dependents = np.random.poisson(1.2, size=n_samples)
+loan_amount = np.random.lognormal(mean=9.0, sigma=0.8, size=n_samples)
+monthly_expenses = income * np.random.uniform(0.2, 0.6, size=n_samples)
+num_late_payments = np.random.poisson(0.5, size=n_samples)
+savings = np.random.lognormal(mean=8.0, sigma=1.2, size=n_samples)
+num_credit_lines = np.random.randint(0, 15, size=n_samples)
+
+# --- Категориальные признаки ---
+employment_type = np.random.choice(
+    ['full_time', 'part_time', 'self_employed', 'unemployed', 'retired'],
+    size=n_samples, p=[0.55, 0.15, 0.15, 0.05, 0.10]
+)
+region = np.random.choice([f'region_{i}' for i in range(8)], size=n_samples)
+education_level = np.random.choice(
+    ['school', 'bachelor', 'master', 'phd'], size=n_samples, p=[0.3, 0.4, 0.25, 0.05]
+)
+
+# --- Синтетическая логика таргета (дефолт зависит от признаков + шум) ---
+logit = (
+    -3.0
+    + 2.5 * debt_ratio
+    + 0.15 * num_late_payments
+    - 0.00002 * income
+    + 0.6 * (employment_type == 'unemployed').astype(float)
+    - 0.3 * (education_level == 'phd').astype(float)
+)
+prob_default = 1 / (1 + np.exp(-logit))
+target = np.random.binomial(1, prob_default)
+
+df = pd.DataFrame({
+    'income': income, 'age': age, 'debt_ratio': debt_ratio,
+    'credit_history_years': credit_history_years, 'num_dependents': num_dependents,
+    'loan_amount': loan_amount, 'monthly_expenses': monthly_expenses,
+    'num_late_payments': num_late_payments, 'savings': savings,
+    'num_credit_lines': num_credit_lines,
+    'employment_type': employment_type, 'region': region, 'education_level': education_level,
+    'default': target,
+})
+
+print(f"Размер датасета: {df.shape}")
+print(f"Доля дефолтов: {df['default'].mean():.4f}")
+
+NUMERIC_COLS = ['income', 'age', 'debt_ratio', 'credit_history_years', 'num_dependents',
+                 'loan_amount', 'monthly_expenses', 'num_late_payments', 'savings', 'num_credit_lines']
+CATEGORICAL_COLS = ['employment_type', 'region', 'education_level']
+TARGET_COL = 'default'
+```
+
+### 9.3. Разделение данных — до какой-либо нормализации (раздел 5.4)
+
+```python
+df_train, df_temp = train_test_split(
+    df, test_size=0.3, stratify=df[TARGET_COL], random_state=42
+)
+df_val, df_test = train_test_split(
+    df_temp, test_size=0.5, stratify=df_temp[TARGET_COL], random_state=42
+)
+
+print(f"Train: {len(df_train)}, Val: {len(df_val)}, Test: {len(df_test)}")
+print(f"Доля дефолтов — train: {df_train[TARGET_COL].mean():.4f}, "
+      f"val: {df_val[TARGET_COL].mean():.4f}, test: {df_test[TARGET_COL].mean():.4f}")
+```
+
+### 9.4. Кодирование категорий — fit только на train
+
+```python
+class CategoryEncoder:
+    """Кодирует категории в целочисленные индексы для nn.Embedding.
+    Индекс 0 зарезервирован под 'неизвестная категория' (аналог handle_unknown='ignore'
+    из OneHotEncoder — на инференсе может встретиться категория, которой не было в train)."""
+
+    def __init__(self):
+        self.mapping = {}
+        self.n_categories = 0   # включая индекс 0 под UNK
+
+    def fit(self, series: pd.Series):
+        uniques = series.unique()
+        self.mapping = {cat: i + 1 for i, cat in enumerate(uniques)}   # реальные категории: 1..N
+        self.n_categories = len(uniques) + 1                            # +1 под UNK (индекс 0)
+        return self
+
+    def transform(self, series: pd.Series) -> np.ndarray:
+        return series.map(self.mapping).fillna(0).astype(np.int64).values
+
+encoders = {}
+for col in CATEGORICAL_COLS:
+    encoders[col] = CategoryEncoder().fit(df_train[col])   # fit ТОЛЬКО на train!
+    print(f"{col}: {encoders[col].n_categories} категорий (включая UNK)")
+```
+
+### 9.5. Нормализация числовых признаков — fit только на train
+
+```python
+scaler = StandardScaler()
+scaler.fit(df_train[NUMERIC_COLS])   # fit ТОЛЬКО на train, как в разделе 5.4/6.1
+```
+
+### 9.6. `TabularDataset` — принимает уже готовые `scaler`/`encoders`
+
+```python
+class TabularDataset(Dataset):
+    """Кастомный Dataset для табличных данных с числовыми и категориальными признаками.
+
+    __getitem__ возвращает (x_numeric, x_categorical, y):
+      x_numeric:     FloatTensor формы (n_numeric,)
+      x_categorical: LongTensor формы (n_categorical,) — индексы для nn.Embedding
+      y:             FloatTensor формы (1,)
+    """
+
+    def __init__(self, df_part: pd.DataFrame, scaler: StandardScaler, encoders: dict):
+        # ВАЖНО: конвертация в тензоры ОДИН РАЗ в __init__ (раздел 3.2).
+        # scaler.transform() (НЕ fit_transform!) — статистики уже посчитаны на train (раздел 5.4).
+        numeric_scaled = scaler.transform(df_part[NUMERIC_COLS])
+        self.X_numeric = torch.tensor(numeric_scaled, dtype=torch.float32)
+
+        cat_arrays = [encoders[col].transform(df_part[col]) for col in CATEGORICAL_COLS]
+        self.X_categorical = torch.tensor(np.stack(cat_arrays, axis=1), dtype=torch.long)
+
+        self.y = torch.tensor(df_part[TARGET_COL].values, dtype=torch.float32).unsqueeze(1)
+
+    def __len__(self):
+        return len(self.y)
+
+    def __getitem__(self, idx):
+        return self.X_numeric[idx], self.X_categorical[idx], self.y[idx]
+
+
+train_dataset = TabularDataset(df_train, scaler, encoders)
+val_dataset = TabularDataset(df_val, scaler, encoders)
+test_dataset = TabularDataset(df_test, scaler, encoders)
+
+# Проверка формы одного примера
+x_num, x_cat, y = train_dataset[0]
+print(f"x_numeric: {x_num.shape}, x_categorical: {x_cat.shape}, y: {y.shape}")
+# x_numeric: torch.Size([10]), x_categorical: torch.Size([3]), y: torch.Size([1])
+```
+
+### 9.7. `DataLoader`
+
+```python
+BATCH_SIZE = 256
+
+train_loader = DataLoader(
+    train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True   # drop_last: защита BatchNorm (раздел 4.4)
+)
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+
+# Проверка формы одного батча
+x_num_batch, x_cat_batch, y_batch = next(iter(train_loader))
+print(f"Батч — x_numeric: {x_num_batch.shape}, x_categorical: {x_cat_batch.shape}, y: {y_batch.shape}")
+# Батч — x_numeric: torch.Size([256, 10]), x_categorical: torch.Size([256, 3]), y: torch.Size([256, 1])
+```
+
+### 9.8. Модель: `nn.Embedding` для категориальных + `nn.Linear` для числовых
+
+```python
+class CreditScoringModel(nn.Module):
+    """
+    Архитектура:
+      x_categorical -> [Embedding_1, Embedding_2, Embedding_3] -> concat
+      x_numeric ------------------------------------------------> concat вместе с embedding'ами
+      -> [Linear -> BatchNorm -> ReLU -> Dropout] x 2 -> Linear(1 логит)
+    """
+
+    def __init__(self, n_numeric: int, cat_cardinalities: list, hidden_dim: int = 64, dropout_p: float = 0.3):
+        super().__init__()
+
+        # Эвристика размерности эмбеддинга (раздел 7.5)
+        embedding_dims = [min(50, (card + 1) // 2) for card in cat_cardinalities]
+
+        # nn.ModuleList — ОБЯЗАТЕЛЬНО, не обычный Python list (раздел 7.6)!
+        self.embeddings = nn.ModuleList([
+            nn.Embedding(num_embeddings=card, embedding_dim=dim)
+            for card, dim in zip(cat_cardinalities, embedding_dims)
+        ])
+
+        total_embedding_dim = sum(embedding_dims)
+        input_dim = n_numeric + total_embedding_dim
+
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim, bias=False),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout_p),
+            nn.Linear(hidden_dim, hidden_dim // 2, bias=False),
+            nn.BatchNorm1d(hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout_p),
+            nn.Linear(hidden_dim // 2, 1),   # 1 сырой логит — для BCEWithLogitsLoss (День 4)
+        )
+
+        self.apply(self._init_weights)
+
+    @staticmethod
+    def _init_weights(module):
+        if isinstance(module, nn.Linear):
+            nn.init.kaiming_uniform_(module.weight, nonlinearity='relu')
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+
+    def forward(self, x_numeric, x_categorical):
+        # x_categorical: (batch, n_categorical) — каждый столбец i идёт в свой Embedding
+        embedded = [emb(x_categorical[:, i]) for i, emb in enumerate(self.embeddings)]
+        x_cat_concat = torch.cat(embedded, dim=1)          # (batch, total_embedding_dim)
+
+        x = torch.cat([x_numeric, x_cat_concat], dim=1)     # (batch, n_numeric + total_embedding_dim)
+        return self.net(x)
+
+
+cat_cardinalities = [encoders[col].n_categories for col in CATEGORICAL_COLS]
+print(f"Кардинальности категорий: {dict(zip(CATEGORICAL_COLS, cat_cardinalities))}")
+
+model = CreditScoringModel(n_numeric=len(NUMERIC_COLS), cat_cardinalities=cat_cardinalities)
+print(model)
+
+total_params = sum(p.numel() for p in model.parameters())
+print(f"Всего параметров: {total_params:,}")
+```
+
+### 9.9. Обучение полного цикла
+
+```python
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Используем device: {device}")
+model = model.to(device)
+
+criterion = nn.BCEWithLogitsLoss()   # сырые логиты на выходе модели (раздел 6.3, День 4)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
+
+
+def train_one_epoch(model, loader, criterion, optimizer, device):
+    model.train()
+    total_loss = 0.0
+    for x_num, x_cat, y in loader:
+        x_num, x_cat, y = x_num.to(device), x_cat.to(device), y.to(device)
+
+        optimizer.zero_grad()
+        logits = model(x_num, x_cat)
+        loss = criterion(logits, y)
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+    return total_loss / len(loader)
+
+
+def evaluate(model, loader, criterion, device):
+    model.eval()
+    total_loss = 0.0
+    all_probs, all_targets = [], []
+    with torch.no_grad():
+        for x_num, x_cat, y in loader:
+            x_num, x_cat, y = x_num.to(device), x_cat.to(device), y.to(device)
+            logits = model(x_num, x_cat)
+            loss = criterion(logits, y)
+            total_loss += loss.item()
+
+            all_probs.append(torch.sigmoid(logits).cpu())
+            all_targets.append(y.cpu())
+
+    probs = torch.cat(all_probs).numpy()
+    targets = torch.cat(all_targets).numpy()
+    return total_loss / len(loader), probs, targets
+
+
+n_epochs = 15
+history = {'train_loss': [], 'val_loss': [], 'val_roc_auc': [], 'val_pr_auc': []}
+
+for epoch in range(n_epochs):
+    train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
+    val_loss, val_probs, val_targets = evaluate(model, val_loader, criterion, device)
+
+    # ROC-AUC и PR-AUC — метрики, уже знакомые тебе из классического ML-курса (Неделя 4-5 roadmap).
+    # Здесь считаются через sklearn ОДИН РАЗ за эпоху на полном val-сете, а не вручную на тензорах
+    # внутри батча (раздел 7.3 конспекта Дня 4) — точность важнее скорости на этом масштабе данных.
+    val_roc_auc = roc_auc_score(val_targets, val_probs)
+    val_pr_auc = average_precision_score(val_targets, val_probs)
+
+    scheduler.step(val_loss)   # ReduceLROnPlateau: ОБЯЗАТЕЛЬНО с аргументом метрики (День 4)
+
+    history['train_loss'].append(train_loss)
+    history['val_loss'].append(val_loss)
+    history['val_roc_auc'].append(val_roc_auc)
+    history['val_pr_auc'].append(val_pr_auc)
+
+    print(f"Эпоха {epoch+1:2d}/{n_epochs} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f} "
+          f"| val_ROC-AUC={val_roc_auc:.4f} | val_PR-AUC={val_pr_auc:.4f}")
+
+# Финальная оценка на test — только один раз, в самом конце
+test_loss, test_probs, test_targets = evaluate(model, test_loader, criterion, device)
+test_roc_auc = roc_auc_score(test_targets, test_probs)
+test_pr_auc = average_precision_score(test_targets, test_probs)
+print(f"\nTest: loss={test_loss:.4f} | ROC-AUC={test_roc_auc:.4f} | PR-AUC={test_pr_auc:.4f}")
+```
+
+### 9.10. Разбор ключевых решений в коде
+
+**Почему `ROC-AUC` и `PR-AUC` считаются через `sklearn`, а не вручную на тензорах:** в отличие от Accuracy (раздел 7.3 Дня 4), которую дёшево и достаточно точно посчитать прямо на GPU-тензорах внутри батча, `ROC-AUC`/`PR-AUC` требуют сортировки всех предсказаний по вероятности и накопления статистики по **всему** датасету целиком (не по отдельным батчам — метрика не аддитивна по батчам). Здесь эффективнее один раз собрать все предсказания в NumPy-массив (`torch.cat(all_probs).numpy()`) и вызвать проверенную, оптимизированную реализацию `sklearn`, чем пытаться реализовывать ranking-метрику вручную на PyTorch.
+
+**Почему `test` оценивается только один раз, в самом конце:** это прямое применение принципа, который ты уже отработал в классическом ML — `test` используется исключительно для финальной, честной оценки уже полностью настроенной модели. Если подглядывать в `test`-метрики во время подбора гиперпараметров (`hidden_dim`, `dropout_p`, `lr` и т.д.), test фактически превращается во второй `val`, и итоговая оценка качества становится оптимистично смещённой — тот же принцип, что и «нельзя тюнить гиперпараметры по test-фолду» из классического ML.
+
+**Почему `weight_decay=1e-5` в оптимизаторе:** сеть с `Embedding`-слоями имеет много параметров относительно объёма данных (раздел 2.4 Дня 4 — L2-регуляризация через `weight_decay`), а редкие категории (например, `region_7`, если она реже встречается в данных) особенно склонны к переобучению — их embedding-векторы обновляются редко и могут «улететь» в нетипичные значения. Небольшая L2-регуляризация — простая защита от этого.
+
+### 9.11. Ожидаемое поведение
+
+- `train_loss`/`val_loss` должны падать, `val_ROC-AUC` — расти к `~0.75-0.82` (значение зависит от случайного шума синтетических данных — точное число не так важно, как сама динамика сходимости).
+- `val_PR-AUC` будет заметно **ниже** `val_ROC-AUC` — ожидаемо при дисбалансе классов (ты уже знаешь эту разницу из классического ML: PR-AUC честнее отражает качество на редком классе, чем ROC-AUC).
+- Если разница между `train_loss` и `val_loss` начинает расти — сигнал переобучения; можно усилить `dropout_p` или `weight_decay` (прямое применение Bias-Variance Tradeoff, разобранного в Дне 3 и в твоём классическом ML roadmap).
+
+---
+
+## 10. Типичные ошибки Дня 5
+
+| Ошибка | Причина | Решение |
+|:---|:---|:---|
+| Обучение аномально медленное, особенно на больших датасетах | Тяжёлые операции (парсинг, конвертация) выполняются в `__getitem__` вместо `__init__` | Конвертируй в тензоры один раз в `__init__`, если данные помещаются в память |
+| `ValueError: Expected more than 1 value per channel when training` на последнем батче эпохи | Последний батч содержит ровно 1 пример, а модель использует `BatchNorm1d` в `train()`-режиме | `drop_last=True` в `DataLoader` для train |
+| Бесконечное порождение процессов / зависание на Windows при `num_workers > 0` | Код запуска обучения не обёрнут в `if __name__ == '__main__':` | Всегда оборачивай точку входа скрипта в этот guard при `num_workers > 0` на Windows |
+| Метрики на val/test оптимистично завышены, при развёртывании в проде модель хуже | `StandardScaler`/`CategoryEncoder` вызывали `.fit()` (или `fit_transform()`) на данных ДО разбиения train/val/test | Сначала `train_test_split`, потом `.fit()` только на train, затем `.transform()` на всех частях |
+| `RuntimeError: stack expects each tensor to be equal size` | Дефолтный `collate_fn` пытается сложить тензоры разной формы (переменная длина последовательностей) | Написать кастомный `collate_fn` с паддингом (`pad_sequence`) |
+| `list(model.parameters())` не содержит embedding-весов, оптимизатор их не обновляет | Список `nn.Embedding` слоёв объявлен как обычный Python `list`, а не `nn.ModuleList` | Всегда `nn.ModuleList` для контейнера переменного числа подмодулей |
+| `IndexError: index out of range in self` внутри `nn.Embedding` на val/test | На val/test встретилась категория, которой не было в train, и её индекс вышел за пределы `num_embeddings` | Резервируй индекс (например, `0`) под "неизвестную категорию" ещё на этапе `fit()` энкодера, как в `CategoryEncoder` |
+| `pin_memory=True` не даёт ускорения | Обучение идёт на CPU (`cuda` недоступна) — `pin_memory` полезен только при переносе на GPU | Проверь `torch.cuda.is_available()`; на CPU-only эту опцию можно не использовать |
+
+---
+
+## 11. Чек-лист навыков Дня 5
+
+| Навык | Проверь себя |
+|:---|:---|
+| Объяснить контракт `Dataset`: зачем нужны именно `__len__` и `__getitem__` | ☐ |
+| Написать кастомный `Dataset` для табличных данных, эффективно (конвертация в `__init__`) | ☐ |
+| Объяснить, зачем `shuffle=True` для train и `False` для val/test | ☐ |
+| Объяснить механизм `num_workers`: процессы, а не потоки, обход GIL, необходимость `__main__` guard на Windows | ☐ |
+| Объяснить, зачем `drop_last=True` защищает `BatchNorm` | ☐ |
+| Объяснить физику `pin_memory` и `non_blocking=True` | ☐ |
+| Написать кастомный `collate_fn` для данных переменной длины | ☐ |
+| Объяснить, почему `random_split` + нормализация внутри `Dataset` — источник Data Leakage | ☐ |
+| Реализовать правильный порядок: split → fit scaler на train → transform на всех частях | ☐ |
+| Вывести формулу `nn.Embedding` как lookup и объяснить связь с `one_hot(idx) @ W` | ☐ |
+| Объяснить, зачем `nn.ModuleList`, а не обычный Python `list`, для контейнера слоёв | ☐ |
+| Собрать модель с `nn.Embedding` для категориальных + `nn.Linear` для числовых признаков, обучить полный цикл | ☐ |
+
+---
+
+## 12. Итоги Дня 5
+
+**Что ты теперь знаешь:**
+
+1. **`Dataset`** — минимальный контракт (`__len__`, `__getitem__`), который позволяет `DataLoader` работать с абсолютно любым источником данных, не зная о его внутреннем устройстве. Это тот же принцип абстракции через интерфейс, что ты уже применял в ООП из Advanced Python.
+2. **Эффективный `Dataset`** конвертирует данные в тензоры один раз в `__init__`, а не при каждом обращении в `__getitem__`.
+3. **`DataLoader`** управляет перемешиванием (`shuffle`), батчингом (`batch_size`), параллельной загрузкой через отдельные **процессы** (`num_workers`, обход GIL), защитой `BatchNorm` от неполных батчей (`drop_last`), ускоренным переносом на GPU (`pin_memory`) и склейкой примеров в батч (`collate_fn`).
+4. **`random_split`/`Subset`** — удобный механизм разбиения индексов, но он **не защищает** от утечки данных, если статистики нормализации были посчитаны до разбиения. Порядок «split → fit на train → transform везде» — универсальное правило, применимое что к `sklearn.Pipeline`, что к `torch.utils.data.Dataset`.
+5. **`nn.Embedding`** — обучаемая, компактная альтернатива one-hot-кодированию для категорий высокой кардинальности: математически эквивалент `one_hot(idx) @ W`, но реализован как эффективный lookup, без построения разреженного промежуточного вектора.
+6. **`nn.ModuleList`** необходим для правильной регистрации переменного числа подмодулей (несколько `Embedding`-слоёв) — иначе они «невидимы» для оптимизатора, ровно та же логика, что у `nn.Parameter` из Дня 3.
+
+**Главный инсайт:** сегодняшний день — это не про новую математику, а про **промышленную дисциплину работы с данными**. Утечка данных, о которой ты уже знаешь всё в контексте `sklearn`, точно так же подстерегает в PyTorch-пайплайнах — просто в новой форме (`random_split` вместо `train_test_split`, `Dataset.__init__` вместо `Pipeline.fit`). Умение распознавать один и тот же концептуальный баг в разных синтаксических обёртках — именно то, что отличает уверенного ML-инженера от того, кто просто скопировал код туториала.
+
+**Связь с твоим roadmap:** архитектура `CreditScoringModel` из сегодняшней практики (числовые фичи через `Linear`, категориальные — через `Embedding`, конкатенация, затем общие слои) — это ровно тот шаблон, который используется в промышленных рекомендательных системах и скоринговых моделях, включая Two-Tower архитектуры из твоего курса RecSys (Модуль 10) — там `User Tower`/`Item Tower` тоже строятся через `Embedding` для ID пользователей/товаров. Понимание `nn.Embedding` сегодня — прямая подготовка к тем модулям.
+
+**Переходи к Дню 6, когда:**
+- Ты можешь с нуля написать `Dataset` для табличных данных, не подглядывая в конспект.
+- Ты понимаешь, почему `random_split` не спасает от Data Leakage, если нормализация была применена раньше времени.
+- Ты можешь объяснить лид-разработчику за 30 секунд, что делает `nn.Embedding` и почему это эффективнее one-hot.
+- Твоя `CreditScoringModel` обучилась полным циклом, и ты видишь осмысленные `ROC-AUC`/`PR-AUC` на val и test.
+
+В Дне 6 всё это соберётся в единый end-to-end проект — `Fraud Detection Lite`: реальные (или близкие к реальным) данные IEEE-CIS, полноценный train/val/test сплит, `BCEWithLogitsLoss` с `pos_weight` под дисбаланс классов, `AdamW`, `ReduceLROnPlateau`, Early Stopping по val-loss, сохранение лучшей модели — и сравнение с `LogisticRegression` из sklearn, чтобы честно ответить на вопрос «а стоило ли оно того».
